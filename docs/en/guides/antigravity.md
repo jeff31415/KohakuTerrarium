@@ -1,10 +1,11 @@
 # Google Antigravity through a local agy login
 
-This optional provider reuses a single **official agy consumer login on Windows**.
+This optional provider reuses a single **official agy consumer login on Windows
+or Linux with session D-Bus and Secret Service**. macOS is not supported yet.
 Sign in using `agy` first. KT does not start an OAuth flow, copy refresh tokens,
 write an account token file, or log out the Google account.
 
-```powershell
+```bash
 kt login google-antigravity
 kt config antigravity status
 kt config antigravity refresh
@@ -59,16 +60,25 @@ Custom model IDs remain supported without inferred effort controls.
 
 ## Ownership and request behavior
 
-The Windows adapter reads only `gemini:antigravity` in Credential Manager and the
-known fallback file `~/.gemini/antigravity-cli/antigravity-oauth-token`. If both
-exist, resolve the conflict in agy before continuing. Only the consumer Bearer
-schema is supported. Tokens remain in memory; the refresh operation is the
+The Windows adapter reads only `gemini:antigravity` in Credential Manager.
+The Linux adapter searches the login collection, or its default alias when the
+login collection is absent, for `service=gemini`, `username=antigravity`.
+It does not create collections or prompt to unlock them, and each read has a
+five-second D-Bus deadline. Linux requires the `antigravity` installation extra.
+Both adapters also check the known fallback file
+`~/.gemini/antigravity-cli/antigravity-oauth-token`. If both sources exist, or
+multiple matching keyring items exist, resolve the conflict in agy before
+continuing. A locked or unavailable store fails explicitly even if a fallback
+file exists; file-only/headless Linux is outside this implementation's scope.
+Only the consumer Bearer schema is supported. Tokens remain in memory; the refresh operation is the
 noninteractive, time-limited `agy --output-format json models` command. A local
 lock serializes refreshes across KT processes, and concurrent callers share one
 refresh within a process.
 
 The transport is pinned to `https://daily-cloudcode-pa.googleapis.com`, using the
-agy 1.2.9 header profile used for the latest metadata discovery. Redirects are rejected.
+agy 1.2.9 header profile used for the latest metadata discovery, with Linux
+platform metadata and user-agent architecture set for x86_64 or aarch64 hosts.
+Redirects are rejected.
 Each request rereads credentials. Project discovery is checked against the token
 used so that an account switch cannot silently combine a new token and an old
 project. Errors omit raw upstream bodies and credential material. A 401 permits
@@ -91,15 +101,58 @@ history binding. A family selector and an explicit tier ID for the same wire
 model can reuse signed history. Switching to OpenAI strips the internal Google
 state from requests.
 
-This first implementation supports local Windows CLI/Web operation only.
-Remote workers, multiple accounts, macOS/Linux credential stores, arbitrary
-endpoints, media generation, and arbitrary extra-body overrides are not supported.
+This implementation supports local Windows and Linux CLI/Web operation.
+Remote workers, multiple accounts, macOS credential stores, Linux without an
+accessible Secret Service, arbitrary endpoints, media generation, and arbitrary
+extra-body overrides are not supported.
 Inline images are accepted; remote image URLs and unsupported content/schema types fail
 explicitly. Discovery lists model IDs and is not a guarantee that every listed
 model supports every modality.
 
 Use of this optional integration remains subject to the account provider's terms
 and restrictions. There is no compatibility or account-availability guarantee.
+
+## Preparing a Linux live test
+
+Automated tests use synthetic credentials and HTTP responses; they do not need a
+Google login. To test against your real account:
+
+1. Install the checkout into your Python environment with
+   `python -m pip install -e '.[antigravity]'`.
+2. Install official agy and complete its consumer Google sign-in. Confirm
+   `agy --version` and `agy --output-format json models` work in a fresh terminal.
+3. Use the same Linux user, home directory, and session D-Bus for agy and KT.
+   `DBUS_SESSION_BUS_ADDRESS` must be available, and a service implementing
+   `org.freedesktop.secrets` (GNOME Keyring or a compatible KWallet setup) must be
+   running. Unlock the keyring through your desktop before testing. Starting a
+   new D-Bus daemon alone does not provide a Secret Service or the saved login.
+4. Avoid retaining an old fallback credential file alongside the keyring login.
+   KT reports `ambiguous_sources` instead of silently selecting an account.
+
+Check service ownership without printing any credential:
+
+```bash
+busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+  org.freedesktop.DBus NameHasOwner s org.freedesktop.secrets
+kt config antigravity status
+kt config antigravity models
+```
+
+The first command should return `b true`. Status should report `state: ready`,
+`source: linux_secret_service`, and `refresh_available: true`. Status is offline;
+models checks authenticated access without generating text. For a full generation
+test, run the example above with your creature and ask for a short reply. This
+uses account quota. Web settings should show the same host account and quota;
+the server must inherit the same user/home/D-Bus environment as the terminal.
+
+For renewal, wait for the access token to expire naturally, verify that status
+reports `expired` with `refresh_available: true`, then run
+`kt config antigravity refresh` and check that status becomes `ready`.
+Calling refresh while the token is fresh skips agy, so it does not prove renewal.
+Do not edit token contents or share tokens for this test. For negative checks,
+run KT with `DBUS_SESSION_BUS_ADDRESS` unset (expect
+`credential_store_unavailable`), or lock the keyring through the desktop (expect
+`credential_store_locked`), then restore the session and verify recovery.
 
 ## Output limits and tool results
 

@@ -1,9 +1,10 @@
 # 复用本地 agy 登录接入 Antigravity
 
-首版支持 **Windows 本机 CLI＋Web、单账号**。先通过官方 `agy` 登录。
+支持 **Windows 和带会话 D-Bus／Secret Service 的 Linux 本机 CLI＋Web、单账号**。
+macOS 暂不支持。先通过官方 `agy` 登录。
 KT 不实现 OAuth 登录，不保存 refresh token，也不会替用户退出 Google 账号。
 
-```powershell
+```bash
 kt login google-antigravity
 kt config antigravity status
 kt config antigravity refresh
@@ -51,13 +52,18 @@ Claude 使用模型目录默认的 1,024 thinking budget，不套用 Anthropic �
 
 ## 凭据与会话
 
-仅检查 Windows 凭据项 `gemini:antigravity` 和已知 agy 后备文件。
-若两处同时存在凭据则明确报错，请先在 agy 中解决来源冲突。
+Windows 仅检查凭据项 `gemini:antigravity`；Linux 精确查询 login collection
+中的 `service=gemini`、`username=antigravity`，login collection 不存在时查询 default alias。
+Linux 需要安装 `antigravity` extra；读取有 5 秒 D-Bus 等待上限，不创建钥匙环，也不弹出解锁窗口。
+两平台同时检查已知 agy 后备文件 `~/.gemini/antigravity-cli/antigravity-oauth-token`。
+若两处同时存在凭据，或钥匙环中匹配到多个条目，则明确报错，请先在 agy 中解决来源冲突。
+钥匙环锁定或不可用时直接报错，不绕过它选择后备文件；本次不支持仅使用文件的无 D-Bus Linux。
 只接受 consumer Bearer 凭据；access token 仅驻留内存，不进入日志。
 KT 通过有超时限制的 agy 子进程刷新，跨进程锁及进程内共享任务避免重复刷新。
 
 请求固定发往 `daily-cloudcode-pa.googleapis.com`，使用 agy 1.2.9
-请求头配置，不跟随重定向。项目发现与凭据代次绑定；账号切换期间会重新核验。
+请求头配置，Linux 的平台元数据和 User-Agent 按 x86_64／aarch64 设置，不跟随重定向。
+项目发现与凭据代次绑定；账号切换期间会重新核验。
 收到任何文本、思考、工具调用或签名后，不自动重发该推理。
 
 会话保存原始签名片段，同时绑定实际模型 ID、项目与当前消息内容。
@@ -70,11 +76,46 @@ Claude 回传时会组装流式文本／思考块及末尾签名，去掉空占�
 
 ## 当前边界
 
-暂不支持远程节点、多账号、macOS/Linux 凭据源、自定义 API 地址、媒体生成及
+暂不支持远程节点、多账号、macOS 凭据源、无可用 Secret Service 的 Linux、自定义 API 地址、媒体生成及
 任意 extra_body 覆盖。支持内联图片，
 其他不支持的内容或工具 schema 会明确报错。发现列表不保证每个模型支持所有模态。
 
 该可选接入仍受账号服务条款与限制约束，由使用者决定是否启用。
+
+## Linux 实机测试准备
+
+自动化测试使用假凭据和离线 HTTP 响应，不需要 Google 账号。
+实机验证需要准备：
+
+1. 在运行 KT 的 Python 环境中安装本分支：`python -m pip install -e '.[antigravity]'`。
+2. 安装官方 agy，并完成个人 Google 账号的 consumer 登录。确认新终端中
+   `agy --version`、`agy --output-format json models` 均可正常运行。
+3. agy 与 KT 使用相同 Linux 用户、HOME 和会话 D-Bus。
+   环境中有 `DBUS_SESSION_BUS_ADDRESS`，并且 GNOME Keyring 或兼容的 KWallet 配置
+   正在提供 `org.freedesktop.secrets`。在桌面中预先解锁钥匙环。
+   单独启动一个 D-Bus daemon 并不会提供 Secret Service 或原有登录。
+4. 不要让旧后备凭据文件与钥匙环登录同时存在，否则 KT 返回 `ambiguous_sources`。
+
+用以下命令检查，不会输出 token：
+
+```bash
+busctl --user call org.freedesktop.DBus /org/freedesktop/DBus \
+  org.freedesktop.DBus NameHasOwner s org.freedesktop.secrets
+kt config antigravity status
+kt config antigravity models
+```
+
+第一条应返回 `b true`；状态应为 `ready`、来源 `linux_secret_service`，
+且 `refresh_available` 为 `true`。`status` 不联网；`models` 验证认证访问，不生成文本。
+再通过本文开头的 `kt run` 命令让你的 creature 回复一句话，即可验证生成，会消耗账号额度。
+Web 设置应显示相同的本机账号状态和额度；Web 服务也必须继承相同用户、HOME、D-Bus 环境。
+
+续期验证：等待 access token 自然过期，先确认状态为 `expired` 且
+`refresh_available: true`，再运行 `kt config antigravity refresh`，预期回到 `ready`。
+token 未过期时该命令会跳过 agy，不能证明续期成功。无需手改或分享 token。
+负面检查可以临时取消 KT 的 `DBUS_SESSION_BUS_ADDRESS`，预期
+`credential_store_unavailable`；或在桌面中锁定钥匙环，预期 `credential_store_locked`。
+恢复环境／解锁后再检查，应恢复正常。
 
 单次 `max_tokens` 覆盖（包括压缩摘要）不修改已保存的 profile，保持该次总输出上限。
 若数字思考预算无法容纳，则仅该次请求取输出上限的一半，并遵守 Gemini Pro 128、

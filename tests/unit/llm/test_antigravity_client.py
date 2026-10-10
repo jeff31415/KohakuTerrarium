@@ -5,8 +5,36 @@ import httpx
 import pytest
 
 from kohakuterrarium.llm import antigravity_auth as auth
+from kohakuterrarium.llm import antigravity_client as client
 from kohakuterrarium.llm.antigravity_client import discover_models
 from kohakuterrarium.llm.antigravity_auth import AntigravityError
+
+
+@pytest.mark.parametrize(
+    "os_name,machine,expected,agent",
+    [
+        ("win32", "AMD64", "WINDOWS_AMD64", "windows; x86_64"),
+        ("linux", "x86_64", "LINUX_AMD64", "linux; x86_64"),
+        ("linux", "AMD64", "LINUX_AMD64", "linux; x86_64"),
+        ("linux", "aarch64", "LINUX_ARM64", "linux; aarch64"),
+        ("linux", "arm64", "LINUX_ARM64", "linux; aarch64"),
+    ],
+)
+def test_wire_platform_is_consistent(monkeypatch, os_name, machine, expected, agent):
+    monkeypatch.setattr(client.sys, "platform", os_name)
+    monkeypatch.setattr(client.platform, "machine", lambda: machine)
+    token = auth.BorrowedCredential("example", time.time() + 3600, "test")
+    headers = client.headers(token, "loadCodeAssist")
+    assert client.metadata()["platform"] == expected
+    assert f"platform={expected}," in headers["Client-Metadata"]
+    assert headers["User-Agent"].endswith(f"({agent})")
+
+
+def test_unknown_linux_architecture_is_rejected(monkeypatch):
+    monkeypatch.setattr(client.sys, "platform", "linux")
+    monkeypatch.setattr(client.platform, "machine", lambda: "riscv64")
+    with pytest.raises(AntigravityError, match="unsupported_platform"):
+        client.metadata()
 
 
 @pytest.mark.asyncio

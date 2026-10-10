@@ -35,7 +35,7 @@ export default {
   "settings.providers.more": "More actions",
   "settings.providers.removeProvider": "Remove provider",
   "settings.antigravity.hint":
-    "Reuse the official agy login on this Windows host. Run agy to sign in. No token is stored by KT.",
+    "Reuse the official agy login on this Windows or Linux host. Linux requires an unlocked Secret Service keyring on the session D-Bus. No token is stored by KT.",
   "settings.antigravity.ready": "Local agy credential is ready.",
   "settings.antigravity.expired":
     "Credentials have expired and agy is unavailable. Install agy and sign in again.",
@@ -43,10 +43,12 @@ export default {
   "settings.antigravity.ambiguous_sources":
     "Both credential sources exist. Resolve the conflict in agy first.",
   "settings.antigravity.unsupported_platform":
-    "This version supports the Windows agy credential store.",
+    "This version supports Windows and Linux with Secret Service. macOS is not supported yet.",
   "settings.antigravity.malformed_credential":
     "Unsupported agy credential format. Sign in again using agy.",
   "settings.antigravity.credential_store_unavailable": "The local credential store is unavailable.",
+  "settings.antigravity.credential_store_locked":
+    "Unlock the local keyring in your desktop session, then check again.",
   "settings.antigravity.localOnly": "Antigravity is supported on the local host only.",
   "settings.antigravity.adminRequired": "Administrator access is required to inspect this account.",
   "settings.antigravity.failed":
@@ -1750,7 +1752,7 @@ export default {
   "settings.account.antigravity.authExpired":
     "agy credentials changed or expired. Check your agy sign-in and refresh.",
   "settings.account.antigravity.localOnly":
-    "Quota is available only for local Windows agy accounts.",
+    "Quota is available only for local Windows or Linux agy accounts.",
   "settings.account.antigravity.noData": "The service returned no quota data.",
   "settings.account.antigravity.loadFailed": "Unable to fetch Antigravity quota.",
   "settings.account.antigravity.stale": "Showing the last successful snapshot from {value}.",

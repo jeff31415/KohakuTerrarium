@@ -50,6 +50,14 @@ describe("OAuth provider actions and status", () => {
     expect(wrapper.text()).toContain("settings.oauth.pending")
     expect(wrapper.text()).not.toContain("settings.oauth.ready")
     expect(wrapper.text()).toContain("settings.oauth.autoRefresh")
+    settingsAPI.getAntigravityStatus.mockResolvedValue({
+      state: "credential_store_locked",
+      refresh_available: true,
+    })
+    await wrapper.get("button").trigger("click")
+    await flushPromises()
+    expect(wrapper.text()).toContain("settings.antigravity.credential_store_locked")
+    expect(wrapper.text()).not.toContain("settings.oauth.missing")
   })
   it("shows expired credentials requiring user action when agy cannot refresh", async () => {
     settingsAPI.getAntigravityStatus.mockResolvedValue({

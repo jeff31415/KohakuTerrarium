@@ -34,7 +34,6 @@ from collections import deque
 import io
 import json
 import random
-import time
 from typing import Any
 
 import httpx
@@ -2481,14 +2480,26 @@ class TestLlmIntegration:
         # A real agent executes a signed Google tool round and resumes its history.
         for is_claude in (False, True):
             with monkeypatch.context() as agy_patch:
+                agy_patch.setattr(agy_auth.Path, "home", lambda: tmp_path)
                 agy_patch.setattr(
                     agy_auth,
-                    "read_sources",
-                    lambda: [
-                        agy_auth.BorrowedCredential(
-                            "offline-agy", time.time() + 3600, "test"
-                        )
-                    ],
+                    "read_keyring",
+                    lambda: (
+                        json.dumps(
+                            {
+                                "auth_method": "consumer",
+                                "token": {
+                                    "access_token": "offline-agy",
+                                    "token_type": "Bearer",
+                                    "expiry": "2099-01-01T00:00:00Z",
+                                },
+                            }
+                        ),
+                        "linux_secret_service",
+                    ),
+                )
+                assert (
+                    agy_auth.AgyCredentials.status()["source"] == "linux_secret_service"
                 )
                 submissions = []
 

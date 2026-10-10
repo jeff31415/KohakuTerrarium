@@ -2,6 +2,8 @@
 
 import asyncio
 import hashlib
+import platform
+import sys
 
 import httpx
 
@@ -9,11 +11,26 @@ from kohakuterrarium.llm.antigravity_auth import AgyCredentials, AntigravityErro
 from kohakuterrarium.llm.recovery import ErrorClass, RetryPolicy
 
 BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:"
-METADATA = {
-    "ideType": "ANTIGRAVITY",
-    "platform": "WINDOWS_AMD64",
-    "pluginType": "GEMINI",
-}
+
+
+def client_platform() -> tuple[str, str, str]:
+    """Return the wire platform and user-agent OS/architecture profile."""
+    if sys.platform == "linux":
+        machine = platform.machine().lower()
+        if machine in {"x86_64", "amd64"}:
+            return "LINUX_AMD64", "linux", "x86_64"
+        if machine in {"aarch64", "arm64"}:
+            return "LINUX_ARM64", "linux", "aarch64"
+        raise AntigravityError("unsupported_platform")
+    return "WINDOWS_AMD64", "windows", "x86_64"
+
+
+def metadata() -> dict:
+    return {
+        "ideType": "ANTIGRAVITY",
+        "platform": client_platform()[0],
+        "pluginType": "GEMINI",
+    }
 
 
 class RequestError(AntigravityError):
@@ -23,12 +40,13 @@ class RequestError(AntigravityError):
 
 
 def headers(token, operation: str) -> dict:
+    wire_platform, operating_system, architecture = client_platform()
     return {
         "Authorization": "Bearer " + token.access_token,
         "Content-Type": "application/json",
-        "User-Agent": f"antigravity-cli/1.2.9/{operation} (windows; x86_64)",
+        "User-Agent": f"antigravity-cli/1.2.9/{operation} ({operating_system}; {architecture})",
         "X-Goog-Api-Client": "google-api-go-client/0.5",
-        "Client-Metadata": "ideType=ANTIGRAVITY,platform=WINDOWS_AMD64,pluginType=GEMINI",
+        "Client-Metadata": f"ideType=ANTIGRAVITY,platform={wire_platform},pluginType=GEMINI",
     }
 
 
@@ -107,7 +125,7 @@ async def post_json(
 async def load_project(client, policy: RetryPolicy) -> tuple:
     for _ in range(3):
         data, token = await post_json(
-            client, "loadCodeAssist", {"metadata": METADATA}, policy
+            client, "loadCodeAssist", {"metadata": metadata()}, policy
         )
         current = await AgyCredentials.ensure_fresh()
         if current.fingerprint != token.fingerprint:

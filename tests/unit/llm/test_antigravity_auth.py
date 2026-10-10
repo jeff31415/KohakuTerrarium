@@ -6,6 +6,7 @@ import time
 import pytest
 
 from kohakuterrarium.llm import antigravity_auth as auth
+from kohakuterrarium.llm import antigravity_store as store
 from kohakuterrarium.llm.antigravity_auth import AntigravityError, BorrowedCredential
 
 
@@ -60,6 +61,58 @@ def test_missing_conflicting_sources_and_offline_status(monkeypatch):
     monkeypatch.setattr(auth, "read_sources", lambda: [a])
     assert auth.AgyCredentials.available()
     assert "access-example" not in json.dumps(auth.AgyCredentials.status())
+
+
+def test_linux_sources_preserve_file_conflicts_and_empty_credentials(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path)
+    raw = [payload()]
+    monkeypatch.setattr(auth, "read_keyring", lambda: (raw[0], "linux_secret_service"))
+    monkeypatch.setattr(auth, "agy_executable", lambda: "/test/agy")
+    assert auth.AgyCredentials.status() == {
+        "state": "ready",
+        "source": "linux_secret_service",
+        "refresh_available": True,
+    }
+    path = tmp_path / ".gemini/antigravity-cli/antigravity-oauth-token"
+    path.parent.mkdir(parents=True)
+    path.write_text(payload("other-account"))
+    assert auth.AgyCredentials.status()["state"] == "ambiguous_sources"
+    raw[0] = None
+    assert auth.load_credential().source == "agy_file"
+    path.unlink()
+    assert auth.AgyCredentials.status()["state"] == "login_required"
+    raw[0] = ""
+    assert auth.AgyCredentials.status()["state"] == "malformed_credential"
+
+
+@pytest.mark.parametrize(
+    "code", ["credential_store_locked", "credential_store_unavailable"]
+)
+def test_linux_store_failures_do_not_select_another_account(
+    monkeypatch, tmp_path, code
+):
+    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path)
+    path = tmp_path / ".gemini/antigravity-cli/antigravity-oauth-token"
+    path.parent.mkdir(parents=True)
+    path.write_text(payload())
+
+    def unavailable():
+        raise AntigravityError(code)
+
+    monkeypatch.setattr(auth, "read_keyring", unavailable)
+    assert auth.AgyCredentials.status()["state"] == code
+    assert not auth.AgyCredentials.available()
+
+
+def test_macos_is_unsupported_even_with_an_agy_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(auth.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(store.sys, "platform", "darwin")
+    path = tmp_path / ".gemini/antigravity-cli/antigravity-oauth-token"
+    path.parent.mkdir(parents=True)
+    path.write_text(payload())
+    assert auth.AgyCredentials.status()["state"] == "unsupported_platform"
 
 
 @pytest.mark.asyncio
