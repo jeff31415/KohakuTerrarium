@@ -14,7 +14,8 @@ identity / config stores — redirected into ``tmp_path`` so the suite
 never touches the user's ``~/.kohakuterrarium`` directory. The only
 seam is the LLM: both ``create_llm_provider`` bind points are
 monkeypatched to a deterministic :class:`ScriptedLLM` for the
-live-creature leg of the journey.
+live-creature leg of the journey. The final shutdown leg uses a real
+Antigravity provider with offline credential and HTTP responses.
 
 The journey, in one method:
 
@@ -31,11 +32,15 @@ The journey, in one method:
 5. Confirm consumption — the registered profile is selectable (shows
    up in the catalog models list) and the default model resolves to
    it; switching the live creature to that profile takes effect.
+6. Generate with Antigravity and terminate the session through the API,
+   verifying that its creature and graph leave the active runtime.
 """
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -44,6 +49,8 @@ from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.api.routes.catalog import _deps as catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.llm import antigravity_auth as agy_auth
+from kohakuterrarium.llm.antigravity_provider import AntigravityProvider
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
 
@@ -152,6 +159,7 @@ class TestApiSettingsJourney:
         client: TestClient,
         creature_dir: Path,
         scripted_llm: ScriptedLLM,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # ── 1. Identity: LLM backend CRUD ─────────────────────────────
         # Baseline: only the built-in backends, no user backends.
@@ -713,3 +721,68 @@ class TestApiSettingsJourney:
         resp = client.delete(f"/api/sessions/active/{session_id}")
         assert resp.status_code == 200
         assert client.get("/api/sessions/active").json() == []
+
+        # A real agy provider can generate a turn and terminate through the API.
+        def agy_http(request):
+            if request.url.path.endswith("loadCodeAssist"):
+                return httpx.Response(200, json={"cloudaicompanionProject": "offline"})
+            assert request.url.path.endswith("streamGenerateContent")
+            assert json.loads(request.content)["model"] == "gemini-3.8-flash-tiered"
+            return httpx.Response(
+                200,
+                text="data: "
+                + json.dumps(
+                    {
+                        "response": {
+                            "candidates": [
+                                {
+                                    "content": {"parts": [{"text": "AGY_OK"}]},
+                                    "finishReason": "STOP",
+                                }
+                            ]
+                        }
+                    }
+                )
+                + "\n\n",
+            )
+
+        agy = AntigravityProvider(
+            "gemini-3.8-flash", transport=httpx.MockTransport(agy_http)
+        )
+        with monkeypatch.context() as agy_patch:
+            agy_patch.setattr(
+                agy_auth,
+                "read_sources",
+                lambda: [
+                    agy_auth.BorrowedCredential("offline-agy", 4102444800, "test")
+                ],
+            )
+            agy_patch.setattr(
+                _bootstrap_llm, "create_llm_provider", lambda config, selector=None: agy
+            )
+            agy_patch.setattr(
+                _agent_init, "create_llm_provider", lambda config, selector=None: agy
+            )
+            created = client.post(
+                "/api/sessions/active/agents",
+                json={
+                    "config_path": str(creature_dir),
+                    "llm": "google-antigravity/gemini-3.8-flash",
+                },
+            )
+            assert created.status_code == 200, created.text
+            session_id = created.json()["session_id"]
+            creature_id = created.json()["agent_id"]
+            creature = engine.list_creatures()[0]
+            response = client.post(
+                f"/api/sessions/{session_id}/creatures/{creature_id}/chat",
+                json={"message": "finish this agy session"},
+            )
+            assert response.status_code == 200, response.text
+            assert response.json() == {"response": "AGY_OK"}
+            stopped = client.delete(f"/api/sessions/active/{session_id}")
+            assert stopped.status_code == 200, stopped.text
+            assert not creature.is_running
+            assert engine.list_creatures() == []
+            assert engine.list_graphs() == []
+            assert client.get("/api/sessions/active").json() == []

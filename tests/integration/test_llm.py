@@ -2636,6 +2636,8 @@ class TestLlmIntegration:
                         for part in signed[0]["_kt_antigravity_content"]["parts"]
                     )
                     session_path = creature.agent.session_store.path
+                    await creature.stop()
+                    assert not creature.is_running
                 resumed = await Terrarium.resume(str(session_path), llm=agy)
                 try:
                     worker = resumed.list_creatures()[0]
@@ -2651,6 +2653,8 @@ class TestLlmIntegration:
                         "AGY_COMPACT_SUMMARY" in (message.get("content") or "")
                         for message in snapshot
                     )
+                    await worker.stop()
+                    assert not worker.is_running
                 finally:
                     await resumed.__aexit__(None, None, None)
                 compacted = await Terrarium.resume(str(session_path), llm=agy)

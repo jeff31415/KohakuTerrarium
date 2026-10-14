@@ -85,6 +85,16 @@ class _StubProvider(BaseLLMProvider):
         )
 
 
+class TestBaseLLMProviderLifecycle:
+    async def test_close_without_persistent_resources_is_repeatable(self):
+        provider = _StubProvider()
+        await provider.fork().close()
+        await provider.close()
+        await provider.close()
+        response = await provider.chat_complete([{"role": "user", "content": "hi"}])
+        assert response.content == "full-response"
+
+
 class TestBaseLLMProviderNormalisation:
     def test_empty_messages_normalise_to_empty_list(self):
         provider = _StubProvider()
