@@ -8,7 +8,7 @@ since each requires live API keys.
 
 import pytest
 
-from kohakuterrarium.llm.antigravity_provider import AntigravityProvider
+from kohakuterrarium.llm.antigravity.provider import AntigravityProvider
 
 from kohakuterrarium.bootstrap import llm as llm_mod
 from kohakuterrarium.bootstrap.llm import (
@@ -17,16 +17,26 @@ from kohakuterrarium.bootstrap.llm import (
     _create_from_profile,
     _extract_controller_data,
     _is_meaningful_config_value,
+    config_names_llm,
     create_llm_provider,
     create_llm_from_profile_name,
 )
-from kohakuterrarium.core.config_types import AgentConfig
-from kohakuterrarium.llm.anthropic_provider import AnthropicProvider
-from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
-from kohakuterrarium.llm.grok_auth import GrokToken
-from kohakuterrarium.llm.grok_provider import GrokSubscriptionProvider
-from kohakuterrarium.llm.openai import OpenAIProvider
-from kohakuterrarium.llm.profile_types import LLMProfile
+from kohakuterrarium.core.config.types import AgentConfig
+from kohakuterrarium.errors import LLMNotConfiguredError
+from kohakuterrarium.llm.anthropic.provider import AnthropicProvider
+from kohakuterrarium.llm.codex.provider import CodexOAuthProvider
+from kohakuterrarium.llm.grok.auth import GrokToken
+from kohakuterrarium.llm.grok.provider import GrokSubscriptionProvider
+from kohakuterrarium.llm.openai.provider import OpenAIProvider
+from kohakuterrarium.llm.profiles.types import LLMProfile
+
+from tests.unit._fakes.package_backend import (
+    echo_backend,
+    install_backend_package,
+    kt_home,  # noqa: F401
+)
+
+pytestmark = pytest.mark.real_llm_provider
 
 # ── _agent_config_default ───────────────────────────────────────
 
@@ -88,6 +98,22 @@ class TestExtractControllerData:
         assert data["llm"] == "openai/gpt-4"
 
 
+class TestConfigNamesLLM:
+    @pytest.mark.parametrize(
+        "fields",
+        [{"model": "gpt-4"}, {"llm_profile": "openai/gpt-4"}],
+    )
+    def test_a_named_model_or_profile_counts(self, fields):
+        assert config_names_llm(AgentConfig(name="a", **fields)) is True
+
+    @pytest.mark.parametrize(
+        "fields",
+        [{}, {"provider": "openai"}, {"temperature": 0.1}, {"extra_body": {"k": 1}}],
+    )
+    def test_settings_without_a_model_do_not_count(self, fields):
+        assert config_names_llm(AgentConfig(name="a", **fields)) is False
+
+
 # ── create_llm_provider routes ──────────────────────────────────
 
 
@@ -122,7 +148,7 @@ class TestCreateLLMProviderProfilePath:
             def __init__(self, **kw):
                 pass
 
-        import kohakuterrarium.llm.codex_provider as codex_provider
+        import kohakuterrarium.llm.codex.provider as codex_provider
 
         monkeypatch.setattr(codex_provider, "CodexOAuthProvider", _StubProvider)
         cfg = AgentConfig(name="a", model="m")
@@ -223,9 +249,41 @@ class TestCreateLLMFromProfileName:
 
 
 class TestCreateFromProfile:
+    def test_package_backend_builds_from_package_without_api_key(
+        self, kt_home, monkeypatch
+    ):
+        install_backend_package(kt_home, "p", [echo_backend(credentials="external")])
+
+        def _no_key(_provider):
+            raise AssertionError("a package backend must not look up an API key")
+
+        monkeypatch.setattr(llm_mod, "get_api_key", _no_key)
+        profile = LLMProfile(
+            name="echo-1",
+            model="echo-model",
+            provider="echo",
+            backend_type="echo",
+            max_context=4321,
+            backend_provider_name="echo",
+        )
+        provider = _create_from_profile(profile)
+        assert type(provider).__name__ == "EchoProvider"
+        assert type(provider).built_from == [profile]
+        assert provider.config.model == "echo-model"
+        assert provider._profile_max_context == 4321
+        assert provider.provider_name == "echo"
+        assert provider._llm_identifier == "echo/echo-1"
+
+    def test_uninstalled_package_backend_raises_typed_error(self, kt_home):
+        profile = LLMProfile(
+            name="x", model="m", provider="ghost", backend_type="ghost"
+        )
+        with pytest.raises(LLMNotConfiguredError, match="'ghost'"):
+            _create_from_profile(profile)
+
     def test_grok_subscription_backend_builds_dedicated_provider(self, monkeypatch):
         monkeypatch.setattr(
-            "kohakuterrarium.llm.grok_provider.GrokTokens.load_candidates",
+            "kohakuterrarium.llm.grok.provider.GrokTokens.load_candidates",
             lambda: [GrokToken(access_token="secret", source="grok-cli")],
         )
         profile = LLMProfile(
@@ -460,7 +518,7 @@ class TestFakeTestBackend:
 
     def test_builds_provider_when_key_present(self, monkeypatch, tmp_path):
         from kohakuterrarium.bootstrap import llm as boot_llm
-        from kohakuterrarium.llm.profile_types import LLMProfile
+        from kohakuterrarium.llm.profiles.types import LLMProfile
         from kohakuterrarium.testing.fake_llm_provider import FakeLLMProvider
 
         monkeypatch.setattr(boot_llm, "get_api_key", lambda provider: "sk-real")
@@ -484,7 +542,7 @@ class TestFakeTestBackend:
 
     def test_missing_key_raises(self, monkeypatch):
         from kohakuterrarium.bootstrap import llm as boot_llm
-        from kohakuterrarium.llm.profile_types import LLMProfile
+        from kohakuterrarium.llm.profiles.types import LLMProfile
 
         monkeypatch.setattr(boot_llm, "get_api_key", lambda provider: "")
         profile = LLMProfile(
@@ -632,36 +690,46 @@ def test_antigravity_resolves_without_key_and_rejects_worker(monkeypatch):
 def test_antigravity_inline_unknown_model_uses_consumer_transport():
     provider = _create_from_inline(
         AgentConfig(
-            name="a", provider="google-antigravity", model="gemini-3.1-pro-high"
+            name="a", provider="google-antigravity", model="gemini-4-argon-high"
         )
     )
     assert isinstance(provider, AntigravityProvider)
-    assert provider.config.model == "gemini-3.1-pro-high"
-    assert provider.config.max_tokens == 65535
-    assert provider._profile_max_context == 1048576
+    assert provider.config.model == "gemini-4-argon-high"
+    assert provider.config.max_tokens == 65536
+    assert provider._profile_max_context == 256000
+    with pytest.raises(ValueError, match="deprecated_model, use gemini-4-argon"):
+        _create_from_inline(
+            AgentConfig(
+                name="a", provider="google-antigravity", model="gemini-3.1-pro-high"
+            )
+        )
 
 
 @pytest.mark.parametrize(
-    "model,effort,output",
+    "selector,effort,output,context",
     [
-        ("gemini-3.6-flash", "low", 65536),
-        ("gemini-3.7-flash", "medium", 65536),
-        ("gemini-3.8-flash", "high", 65536),
-        ("gemini-3.1-pro", "low", 65535),
+        ("gemini-3.8-flash@reasoning=low", "low", 65536, 256000),
+        ("gemini-3.8-flash@reasoning=high,context=1048k", "high", 65536, 1048576),
+        ("gemini-4-argon", "medium", 65536, 256000),
+        ("gemini-4-argon@reasoning=high,context=900k", "high", 65536, 900000),
+        ("claude-opus-5-5@reasoning=low", "low", 128000, 256000),
+        ("gpt-oss-120b", "medium", 32768, 80000),
+        ("gemini-3.1-pro@reasoning=low", "low", 65536, 256000),
     ],
 )
-def test_antigravity_variation_bootstrap(model, effort, output):
+def test_antigravity_variation_bootstrap(selector, effort, output, context):
     provider = create_llm_provider(
-        AgentConfig(name="a"), f"google-antigravity/{model}@reasoning={effort}"
+        AgentConfig(name="a"), f"google-antigravity/{selector}"
     )
     assert provider.reasoning_effort == effort
     assert provider.config.max_tokens == output
-    assert provider._profile_max_context == 1048576
+    assert provider._profile_max_context == context
 
 
 def test_antigravity_inline_claude_limits():
     provider = _create_from_inline(
-        AgentConfig(name="a", provider="google-antigravity", model="claude-sonnet-4-6")
+        AgentConfig(name="a", provider="google-antigravity", model="claude-sonnet-5-5")
     )
-    assert provider.config.max_tokens == 64000
-    assert provider._profile_max_context == 250000
+    assert provider.config.max_tokens == 128000
+    assert provider._profile_max_context == 256000
+    assert provider._settings.wire_model == "claude-sonnet-5-5-medium"

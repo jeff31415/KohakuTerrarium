@@ -7,8 +7,15 @@ fake that exposes the same ``acompletion`` surface used by the provider.
 import base64
 import importlib
 import sys
+import threading
+from pathlib import Path
 
 import pytest
+
+from kohakuterrarium.llm.media.reference import session_media_scope
+
+# The first test in a worker imports litellm, which is slow under parallel load.
+pytestmark = [pytest.mark.real_llm_provider, pytest.mark.timeout(240)]
 
 
 class _FakeLitellm:
@@ -64,14 +71,84 @@ class _Response:
 _fake_litellm = _FakeLitellm()
 
 
+PROVIDER_MODULE = "kohakuterrarium.llm.litellm_provider"
+
+
 @pytest.fixture
 def lpm(monkeypatch):
+    """Import the provider afresh against the fake SDK, then restore what was there.
+
+    A provider module imported earlier in the same worker is bound to the real
+    SDK, which would then run instead of the fake.
+    """
+    parent = importlib.import_module("kohakuterrarium.llm")
+    previous = sys.modules.pop(PROVIDER_MODULE, None)
+    previous_attribute = parent.__dict__.get("litellm_provider")
     monkeypatch.setitem(sys.modules, "litellm", _fake_litellm)
-    module = importlib.import_module("kohakuterrarium.llm.litellm_provider")
-    return module, _fake_litellm
+    module = importlib.import_module(PROVIDER_MODULE)
+    yield module, _fake_litellm
+    sys.modules.pop(PROVIDER_MODULE, None)
+    parent.__dict__.pop("litellm_provider", None)
+    if previous is not None:
+        sys.modules[PROVIDER_MODULE] = previous
+        parent.__dict__["litellm_provider"] = previous_attribute
 
 
 class TestMediaReferences:
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_selected_image_reads_run_off_loop_with_session_context(
+        self, lpm, monkeypatch, tmp_path, stream
+    ):
+        module, sdk = lpm
+        session = tmp_path / "own.kohakutr"
+        artifacts = session.with_suffix(".artifacts")
+        artifacts.mkdir()
+        (artifacts / "pic.png").write_bytes(b"PNG")
+        loop_thread = threading.get_ident()
+        original_read = Path.read_bytes
+        reads = []
+
+        def read(path):
+            reads.append(threading.get_ident())
+            assert threading.get_ident() != loop_thread
+            return original_read(path)
+
+        async def reply(**params):
+            assert (
+                params["messages"][0]["content"][0]["image_url"]["url"]
+                == "data:image/png;base64,UE5H"
+            )
+            if not stream:
+                return _Response(_Message("ok"))
+
+            async def chunks():
+                yield _Chunk(_Delta("ok"))
+
+            return chunks()
+
+        monkeypatch.setattr(Path, "read_bytes", read)
+        monkeypatch.setattr(sdk, "acompletion", reply)
+        provider = module.LiteLLMProvider(model="openai/test", api_key="k")
+        with session_media_scope(session):
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "/api/sessions/own/artifacts/pic.png"},
+                        }
+                    ],
+                }
+            ]
+            if stream:
+                assert (
+                    "".join([chunk async for chunk in provider.chat(messages)]) == "ok"
+                )
+            else:
+                assert (await provider.chat_complete(messages)).content == "ok"
+        assert len(reads) == 1
+
     def test_build_params_inlines_local_media_references(self, lpm, tmp_path):
         module, _ = lpm
         pic = tmp_path / "seen.png"

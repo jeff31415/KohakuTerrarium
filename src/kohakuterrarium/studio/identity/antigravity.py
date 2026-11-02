@@ -7,19 +7,19 @@ from datetime import datetime
 
 import httpx
 
-from kohakuterrarium.llm.antigravity_auth import (
+from kohakuterrarium.llm.antigravity.auth import (
     AgyCredentials,
     AntigravityError,
     load_credential,
 )
-from kohakuterrarium.llm.antigravity_client import (
+from kohakuterrarium.llm.antigravity.client import (
     BASE_URL,
     RequestError,
     discover_models,
     headers,
     load_project,
 )
-from kohakuterrarium.llm.recovery import RetryPolicy
+from kohakuterrarium.llm.recovery.errors import RetryPolicy
 
 
 def get_status() -> dict:
@@ -112,7 +112,7 @@ async def _fetch_usage(transport) -> dict:
         project, _, token = await load_project(client, RetryPolicy(max_retries=0))
         response = await client.post(
             BASE_URL + "retrieveUserQuotaSummary",
-            headers=headers(token, "retrieveUserQuotaSummary"),
+            headers=headers(token),
             json={"project": project},
         )
         if response.status_code in (401, 403):

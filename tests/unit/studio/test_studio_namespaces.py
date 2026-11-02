@@ -31,6 +31,7 @@ from kohakuterrarium.studio.persistence import (
     store as _persistence_store_mod,
 )
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
+from kohakuterrarium.utils.config_dir import config_dir
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -69,11 +70,19 @@ class TestCatalogBuiltins:
         # description comes from the tool class, not a hardcoded string.
         assert bash["description"]
 
-    def test_list_subagents_contains_coordinator(self):
+    def test_list_subagents_contains_inspection_and_service_presets(self):
         s = Studio()
         subs = s.catalog.builtins.list("subagents")
         names = {x["name"] for x in subs}
-        assert "coordinator" in names
+        assert names == {
+            "fork",
+            "explore",
+            "critic",
+            "response",
+            "summarize",
+            "memory_read",
+            "memory_write",
+        }
         assert all(x["source"] == "builtin" for x in subs)
 
     def test_list_none_unions_all_kinds(self):
@@ -274,7 +283,9 @@ class TestIdentitySettings:
             "mcp_servers",
             "ui_prefs",
         }
-        # Each config file lives under the advertised home directory.
+        # The advertised home is the live config root (KT_CONFIG_DIR) and every
+        # config file lives directly under it.
+        assert paths["home"] == config_dir()
         for key in ("llm_profiles", "api_keys", "mcp_servers", "ui_prefs"):
             assert paths[key].parent == paths["home"]
 

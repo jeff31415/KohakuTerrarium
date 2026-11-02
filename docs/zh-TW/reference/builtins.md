@@ -86,18 +86,21 @@ KohakuTerrarium 隨附的所有內建工具、子代理、輸入、輸出、使�
 
 ### Web
 
-**`web_fetch`**：將 URL 擷取為 markdown。依序嘗試 `crawl4ai` →
-`trafilatura` → Jina proxy → `httpx + html2text`。上限 100k 字元，逾時 30 秒。直接執行。
+**`web_fetch`**：將 URL 擷取為 Markdown。預設 `backend: auto` 保持
+`crawl4ai` → `trafilatura` → Jina → `httpx + html2text` 鏈；
+`backend: deepseek` 使用直連 Fetch，`fallback: auto` 明確允許暫時故障後回退。
 
-- 參數：`url`。
+- 參數：`url`、`max_length`（1–100000，預設 100000）。
 
-**`web_search`**：預設使用 DuckDuckGo，也可明確選擇 Codex 訂閱或
-DeepSeek Responses 後端。執行 `kt login codex` 後可設定
-`backend: codex`；此後端與目前 Creature 主模型無關。DeepSeek 需先執行
-`kt config key set deepseek`，再設定 `backend: deepseek`。兩個明確選擇的
-Provider 後端均可設定 `fallback: duckduckgo` 處理暫時故障。直接執行。
+**`web_search`**：預設 DuckDuckGo，可選 `codex`、`deepseek_api`（直連 Search）
+和 `deepseek`（舊 Responses，僅 Pro）。DeepSeek Key 透過 `kt config key set deepseek`
+設定。`fallback: duckduckgo` 僅處理暫時故障。後端獨立於 Creature 主模型。
+直連結果保留來源 URL，不標記為模型驗證過的引用。
 
-- 參數：`query`、`max_results`（int）、`region`（str）。
+- 參數：`query`、`max_results`（相容 `limit`）；直連另支援 `need_content`、
+  `ori_question`。直連 query 為 1–128 字元，結果數為 1–50；
+  `localization` 執行時設定填寫 IP。
+
 
 ### 互動與記憶
 
@@ -314,14 +317,14 @@ LLM 可輸出的內嵌指令，可取代工具呼叫。它們會直接與框架�
 
 ## LLM presets
 
-隨附於 `src/kohakuterrarium/llm/presets.py`。可作為 `llm:` 或 `--llm` 的值。
+隨附於 `src/kohakuterrarium/llm/presets/catalog.py`。可作為 `llm:` 或 `--llm` 的值。
 
 命名慣例 (2026-04 重構後)：
 
-- 直連 / 原生 API 變體是主要名稱 (`claude-opus-4.7`、`gemini-3.1-pro`、`mimo-v2-pro`)。
+- 直連 / 原生 API 變體是主要名稱 (`claude-opus-4.7`、`gemini-4-argon`、`mimo-v2-pro`)。
 - 走 OpenRouter 的變體用 `-or` 後綴 (`claude-opus-4.7-or`)。
 - OpenAI 是例外：`gpt-5.4` 綁在 **Codex OAuth** provider 上；OpenAI 直連變體用 `-api`，OpenRouter 用 `-or`。
-- 舊名稱 (`claude-opus-4.6-direct`、`or-gpt-5.4`、`gemini-3.1-pro-direct`、`mimo-v2-pro-direct`…) 以別名保留，既有 config 仍然可用。
+- 舊名稱 (`claude-opus-4.6-direct`、`or-gpt-5.4`、`mimo-v2-pro-direct`…) 以別名保留，既有 config 仍然可用。
 
 ### OpenAI 透過 Codex OAuth
 
@@ -373,16 +376,23 @@ LLM 可輸出的內嵌指令，可取代工具呼叫。它們會直接與框架�
 
 ### Google Gemini 直連 (OpenAI-compat)
 
-- `gemini-3.1-pro` (別名：`gemini`、`gemini-pro`；舊：`gemini-3.1-pro-direct`)
-- `gemini-3-flash` (`gemini-flash`；舊：`gemini-3-flash-direct`)
-- `gemini-3.1-flash-lite` (`gemini-lite`；舊：`gemini-3.1-flash-lite-direct`)
+- `gemini-4-argon` (別名：`gemini`、`gemini-pro`)
+- `gemini-3.8-flash` (`gemini-flash`)
+- `gemini-3.5-flash-lite` (`gemini-lite`)
 
 ### Google Gemini 透過 OpenRouter (`-or` 後綴)
 
-- `gemini-3.1-pro-or`
-- `gemini-3-flash-or`
-- `gemini-3.1-flash-lite-or`
-- `nano-banana` (生圖模型，OpenRouter)
+- `gemini-4-argon-or`
+- `gemini-3.8-flash-or`
+- `gemini-3.5-flash-lite-or`
+- `nano-banana` (Nano Banana 2.1 生圖模型，OpenRouter)
+
+### 已棄用的預設
+
+已退役的預設仍可解析，會落到同一 provider 上的後繼預設並記錄警告：
+`gemini-3.1-pro` → `gemini-4-argon`、`gemini-3.5-flash` → `gemini-3.8-flash`、
+`gemini-3.1-flash-lite` → `gemini-3.5-flash-lite`（`gemini` 與 `openrouter`，
+含 `-direct` / `-or` 名稱）。已退役的 Google Antigravity 預設同樣對應。同名的使用者預設優先。
 
 ### Google Gemma (OpenRouter)
 
@@ -462,7 +472,7 @@ LLM 可輸出的內嵌指令，可取代工具呼叫。它們會直接與框架�
 - `ministral-3-14b` (`ministral`)
 - `ministral-3-8b`
 
-每個 preset 的 token window (`max_context` / `max_output`) 會因 preset 而異，確切值請看 `src/kohakuterrarium/llm/presets.py`，或執行 `kt config llm show <name>`。`controller.max_tokens` 會覆寫 `max_output`；要調壓縮時的 window，請設 `compact.max_tokens`。
+每個 preset 的 token window (`max_context` / `max_output`) 會因 preset 而異，確切值請看 `src/kohakuterrarium/llm/presets/catalog.py`，或執行 `kt config llm show <name>`。`controller.max_tokens` 會覆寫 `max_output`；要調壓縮時的 window，請設 `compact.max_tokens`。
 
 內建 preset 合併時也會把安裝套件貢獻的 `llm_presets` 一併納入；見 [configuration.md：Package manifest](configuration.md#package-manifest-kohakuyaml)。
 
@@ -521,18 +531,20 @@ Patch 到 `extra_body.reasoning.effort`。只有 Opus 4.7 認 `xhigh`。
 
 ### Google Gemini：直連
 
-Patch 到 `extra_body.google.thinking_config.thinking_level`。
+Patch 到 `extra_body.extra_body.google.thinking_config.thinking_level`：Gemini
+OpenAI-compat 端點只在請求本體層級的 `extra_body` 物件中讀取 `google`。
 
 | Preset | Group | Options |
 |---|---|---|
-| `gemini-3.1-pro` | `thinking` | `low`、`medium`、`high` |
-| `gemini-3-flash`、`gemini-3.1-flash-lite` | `thinking` | `minimal`、`low`、`medium`、`high` |
+| `gemini-4-argon` (預設 `high`)、`gemini-3.8-flash` (預設 `high`) | `thinking` | `low`、`medium`、`high` |
+| `gemini-3.5-flash-lite` (預設 `medium`) | `thinking` | `minimal`、`low`、`medium`、`high` |
 
 ### Google Gemini：OpenRouter
 
 | Preset | Group | Options |
 |---|---|---|
-| `gemini-3.1-pro-or`、`gemini-3-flash-or`、`gemini-3.1-flash-lite-or` | `reasoning` | `minimal`、`low`、`medium`、`high` |
+| `gemini-4-argon-or`、`gemini-3.8-flash-or` | `reasoning` | `low`、`medium`、`high` |
+| `gemini-3.5-flash-lite-or` | `reasoning` | `minimal`、`low`、`medium`、`high` |
 
 ### Gemma / Qwen / Kimi / MiMo / GLM：OpenRouter
 
@@ -562,18 +574,11 @@ Grok 4.x (`grok-4`、`grok-4.20`、`grok-4.20-multi`、`grok-4-fast`、`grok-4.1
 
 ---
 
-## Prompt plugin
+## Prompt 區段
 
-隨附的 prompt plugin (由 `prompt/aggregator.py` 載入)。依 priority 排序 (數字越小越早執行)。
+`prompt/aggregator.py` 由帶門控的框架區段組合出 system prompt：creature 的基礎 prompt、`## Available Functions` 與 `## Function Documentation`（文字工具格式或 `full` 文件模式）、`## Tool guidance`、外掛貢獻、`## Skills`、group 區塊（僅限處於圖中的 creature）以及執行模型。主題不存在的區段不會輸出。
 
-| Priority | 名稱 | 產出 |
-|---|---|---|
-| 50 | `ToolListPlugin` | 工具名稱 + 一行描述。 |
-| 45 | `FrameworkHintsPlugin` | 框架命令範例 (`info`、`read_job`、`jobs`、`wait`) 與 tool-call 格式範例。 |
-| 40 | `EnvInfoPlugin` | `cwd`、平台、日期/時間。 |
-| 30 | `ProjectInstructionsPlugin` | 載入 `CLAUDE.md` 與 `.claude/rules.md`。 |
-
-自訂 prompt plugin 繼承 `BasePlugin`，在 creature config 的 `plugins` 欄位註冊。生命週期與 callback hook 見 [plugin-hooks.md](plugin-hooks.md)。
+外掛透過在 `BasePlugin` 子類別上覆寫 `get_prompt_content(context)` 來增加文字，並在 creature config 的 `plugins` 欄位註冊。hook 見 [plugin-hooks.md](plugin-hooks.md)。工具透過 `prompt_contribution()` 向彙整的 `## Tool guidance` 區段貢獻一行或短段落的指引。
 
 ---
 

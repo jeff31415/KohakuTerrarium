@@ -20,6 +20,8 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
+    # ``-n auto`` (pyproject addopts) resolves to one xdist worker per vCPU on
+    # hosted runners; plans/ci-parallel-tests/00-plan.md has the measurements.
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +38,26 @@ jobs:
           - os: windows-latest
             python-version: "3.14"
     steps:
+      # The suite creates many small files (per-test roots, SQLite + sidecars);
+      # real-time scanning and NTFS dominate Windows wall time.
+      - name: Disable Defender real-time scanning
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Set-MpPreference -DisableRealtimeMonitoring $true
+      - name: Create Dev Drive
+        if: runner.os == 'Windows'
+        uses: samypr100/setup-dev-drive@v3
+        with:
+          drive-size: 20GB
+          drive-format: ReFS
+      - name: Point TEMP at the Dev Drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tmp = Join-Path $env:DEV_DRIVE "tmp"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          "TEMP=$tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "TMP=$tmp" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -54,7 +76,7 @@ jobs:
           git clone https://github.com/Kohaku-Lab/kt-biome.git "$RUNNER_TEMP/kt-biome"
           kt install "$RUNNER_TEMP/kt-biome" -e
       - name: Run unit tests
-        run: pytest tests/unit/ -v --tb=short --ignore=tests/unit/test_file_sizes.py --ignore=tests/unit/test_dep_graph_lint.py
+        run: pytest tests/unit/ --tb=short --durations=30 --ignore=tests/unit/test_file_sizes.py --ignore=tests/unit/test_dep_graph_lint.py
       - name: Run integration tests
         # E2E tests (tests/e2e/) are intentionally NOT run in CI —
         # they spin up real WebSocket-backed lab clusters, subprocess
@@ -65,7 +87,7 @@ jobs:
         # protection come from the unit + integration tiers; e2e is
         # the developer surface for reproducing real user behavior
         # locally (see tests/README.md).
-        run: pytest tests/integration/ -v --tb=short
+        run: pytest tests/integration/ --tb=short --durations=30
 
   test-format-guards:
     runs-on: ubuntu-latest
@@ -80,7 +102,7 @@ jobs:
         run: |
           pip install -e ".[dev]"
       - name: Run file size guards
-        run: pytest tests/unit/test_file_sizes.py -v --tb=short
+        run: pytest tests/unit/test_file_sizes.py -n 0 -v --tb=short
 
   test-dep-graph:
     runs-on: ubuntu-latest
@@ -95,7 +117,30 @@ jobs:
         run: |
           pip install -e ".[dev]"
       - name: Run dep-graph lint guard
-        run: pytest tests/unit/test_dep_graph_lint.py -v --tb=short
+        run: pytest tests/unit/test_dep_graph_lint.py -n 0 -v --tb=short
+
+  desktop-shell:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: packaging/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packaging/desktop/src-tauri
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --features source-dev --locked -- -D warnings
+      - run: cargo test --features source-dev --locked
 
   frontend-check:
     runs-on: ubuntu-latest
@@ -109,6 +154,13 @@ jobs:
           node-version: "24"
       - run: npm ci
       - run: npm run format:check
+      - run: npm run test:desktop-dev
+      - name: Run desktop development UI regression tests
+        run: >-
+          npm test -- --maxWorkers=4
+          src/utils/hostBridge.test.js
+          src/components/settings/DesktopAppSettings.test.js
+          src/composables/useBackendStatus.test.js
       - name: Run history and branch regression tests
         run: >-
           npm test -- --maxWorkers=4

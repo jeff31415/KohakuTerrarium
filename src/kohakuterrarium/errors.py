@@ -42,6 +42,10 @@ class ConflictError(KTError):
     """The operation conflicts with existing state."""
 
 
+class PluginToolConflictError(ConflictError, ValueError):
+    """A plugin contributed a tool whose name is already taken."""
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -83,6 +87,10 @@ class PackagePathNotFoundError(PackageError, FileNotFoundError):
 
 class LLMError(KTError):
     """LLM provider construction or call failure."""
+
+
+class MediaReferenceError(LLMError):
+    """Required local media could not be prepared for a provider request."""
 
 
 class LLMNotConfiguredError(LLMError, ValueError):
@@ -172,3 +180,12 @@ class TurnTimeoutError(TurnError, TimeoutError):
 
 class AgentNotRunningError(KTError, RuntimeError):
     """An operation needed a started agent but it isn't running."""
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+
+class RendererUnavailable(KTError, RuntimeError):
+    """No attached output can render the requested widget renderer."""

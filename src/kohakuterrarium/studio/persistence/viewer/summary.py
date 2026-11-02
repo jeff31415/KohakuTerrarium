@@ -7,13 +7,21 @@ sessions.
 from collections.abc import Iterable
 from typing import Any
 
-from kohakuterrarium.errors import NotFoundError
+from kohakuterrarium.session.history.replay import dedupe_adjacent_duplicate_events
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.persistence.viewer.agents import (
+    viewer_agent_names as _agents_for_summary,
+)
 from kohakuterrarium.studio.persistence.viewer.rollups import (
+    _add_usage,
+    _aggregate_rollup_contributions,
+    _creature_total_usage,
     _event_failed,
-    aggregate_turn_rollups,
-    graph_total_usage,
-    rollups_or_derived,
+    _iter_rollup_contributions_from_events,
+    _merge_subagents,
+    _own_rollups_from_events,
+    derive_subagent_turns_from_events,
+    list_agent_namespaces,
 )
 
 
@@ -29,33 +37,6 @@ def _subagent_failed(evt: dict) -> bool:
             or final_state in {"error", "interrupted", "cancelled"}
         )
     )
-
-
-def _agents_for_summary(
-    meta: dict[str, Any], store: SessionStore, requested: str | None
-) -> list[str]:
-    """Select and order agent namespaces for the overview.
-
-    A requested agent must belong to the session. Without one, all main and
-    attached namespaces are included, with ``viewer_default_agent`` first.
-    ``load_meta`` already includes event-discovered creatures in ``agents``.
-    """
-    main_agents = list(meta.get("agents") or [])
-    attached_namespaces = [
-        e["namespace"] for e in store.discover_attached_agents() if e.get("namespace")
-    ]
-    known_agents = main_agents + [
-        n for n in attached_namespaces if n not in main_agents
-    ]
-    if requested is None:
-        default = meta.get("viewer_default_agent")
-        if isinstance(default, str) and default in known_agents:
-            ordered = [default] + [a for a in known_agents if a != default]
-            return ordered
-        return known_agents
-    if requested not in known_agents:
-        raise NotFoundError(f"Agent not found in session: {requested}")
-    return [requested]
 
 
 def _aggregate_rollups(
@@ -131,6 +112,27 @@ def _scan_events_for_summary(events: list[dict]) -> dict[str, Any]:
     }
 
 
+def _namespace_summary_stats(
+    store: SessionStore, name: str, kind: str, *, for_graph: bool
+) -> tuple[list[Any], dict[str, Any] | None, dict[str, Any]]:
+    """Return derived rollups, usage, and raw diagnostics for one namespace."""
+    raw = store.get_events(name)
+    diagnostics = _scan_events_for_summary(raw)
+    events = dedupe_adjacent_duplicate_events(raw)
+    stored = store.list_turn_rollups(name)
+    if for_graph:
+        rows: list[Any] = list(
+            _iter_rollup_contributions_from_events(name, kind, events, stored)
+        )
+        usage: dict[str, Any] | None = _creature_total_usage(events, stored)
+    else:
+        own_rows = _own_rollups_from_events(name, events, stored)
+        sub_rows = derive_subagent_turns_from_events(events, name)
+        rows = _merge_subagents(own_rows, sub_rows, name)
+        usage = None
+    return rows, usage, diagnostics
+
+
 def build_summary_payload(
     store: SessionStore, session_name: str, agent: str | None
 ) -> dict[str, Any]:
@@ -142,11 +144,25 @@ def build_summary_payload(
     """
     meta = store.load_meta()
     agents = _agents_for_summary(meta, store, agent)
+    names = list_agent_namespaces(store) if agent is None else [(agents[0], "main")]
+    contributions: dict[str, list[Any]] = {}
+    diagnostics: dict[str, dict[str, Any]] = {}
+    graph = {"tokens_in": 0, "tokens_out": 0, "tokens_cached": 0, "cost_usd": None}
+    for name, kind in names:
+        rows, usage, diag = _namespace_summary_stats(
+            store, name, kind, for_graph=agent is None
+        )
+        contributions[name] = rows
+        diagnostics[name] = diag
+        if usage is not None:
+            _add_usage(graph, usage)
 
     if agent is None:
-        flat_rollups = aggregate_turn_rollups(store)
+        flat_rollups = _aggregate_rollup_contributions(
+            contrib for name, _kind in names for contrib in contributions[name]
+        )
     else:
-        flat_rollups = rollups_or_derived(store, agents[0])
+        flat_rollups = contributions[agents[0]]
 
     totals = _aggregate_rollups(flat_rollups, count_by_agent=agent is None)
 
@@ -154,7 +170,6 @@ def build_summary_payload(
         # Channel-driven cycles lack turn indexes, so graph token and cost
         # totals use the turn-agnostic sum. Turn counts and hot turns retain
         # their positive-turn-index semantics.
-        graph = graph_total_usage(store)
         totals["tokens"] = {
             "prompt": graph["tokens_in"],
             "completion": graph["tokens_out"],
@@ -184,9 +199,18 @@ def build_summary_payload(
         for r in hot_sorted
     ]
 
-    event_totals = {"tool_calls": 0, "error_turns": [], "compact_turns": []}
+    event_totals: dict[str, Any] = {
+        "tool_calls": 0,
+        "error_turns": [],
+        "compact_turns": [],
+    }
     for a in agents:
-        per_agent = _scan_events_for_summary(store.get_events(a))
+        namespace = str(a)
+        if namespace not in diagnostics:
+            diagnostics[namespace] = _scan_events_for_summary(
+                store.get_events(namespace)
+            )
+        per_agent = diagnostics[namespace]
         event_totals["tool_calls"] += per_agent["tool_calls"]
         event_totals["error_turns"].extend(per_agent["error_turns"])
         event_totals["compact_turns"].extend(per_agent["compact_turns"])

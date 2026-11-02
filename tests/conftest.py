@@ -16,9 +16,12 @@ Discipline rules — every test in any tier must follow these:
 These rules are how we earn the right to claim "covered."
 """
 
+import ipaddress
 import os
+import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -40,8 +43,87 @@ if str(_SRC) not in sys.path:
 # narrows this to a per-test ``tmp_path`` so tests don't share state.
 _SESSION_CONFIG_DIR = Path(tempfile.mkdtemp(prefix="kt-test-session-config-"))
 os.environ["KT_CONFIG_DIR"] = str(_SESSION_CONFIG_DIR)
+# The operator's home, captured before any fixture redirects HOME; read-only.
+os.environ.setdefault("KT_TEST_REAL_HOME", str(Path.home()))
+# LiteLLM reads its bundled cost map instead of retrying a blocked download.
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
 
-from kohakuterrarium.llm.api_keys import PROVIDER_KEY_MAP  # noqa: E402
+if sys.platform == "win32":
+    # A detached parent has no console, so every console child (xdist workers,
+    # import-contract probes, git) would open its own window; hide them all.
+    _popen_init = subprocess.Popen.__init__
+
+    def _popen_init_hidden(self, *args, **kwargs):
+        flags = kwargs.get("creationflags", 0)
+        if not flags & (subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS):
+            kwargs["creationflags"] = flags | subprocess.CREATE_NO_WINDOW
+        _popen_init(self, *args, **kwargs)
+
+    subprocess.Popen.__init__ = _popen_init_hidden
+
+from kohakuterrarium.llm.profiles.api_keys import PROVIDER_KEY_MAP  # noqa: E402
+from kohakuterrarium.testing.llm_seam import (  # noqa: E402
+    forbid_real_providers,
+    install_llm_seam,
+)
+
+_LOOPBACK_NAMES = {"localhost", "localhost.localdomain", "ip6-localhost", ""}
+_NETWORK_GUARD = {"blocked": False}
+
+
+def _is_loopback(host) -> bool:
+    if host is None:
+        return True
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "ignore")
+    host = str(host).strip("[]").split("%", 1)[0].lower()
+    if host in _LOOPBACK_NAMES:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback or host in ("0.0.0.0", "::")
+    except ValueError:
+        return False
+
+
+def _network_audit(event, args):
+    """Refuse non-loopback connects and lookups while a test blocks the network."""
+    if not _NETWORK_GUARD["blocked"]:
+        return
+    if event == "socket.connect":
+        address = args[1]
+        host = address[0] if isinstance(address, tuple) and address else None
+    elif event == "socket.getaddrinfo":
+        host = args[0]
+    else:
+        return
+    if not _is_loopback(host):
+        raise OSError(
+            f"network is blocked in tests (to {host!r}); "
+            "mark the test @pytest.mark.allow_network if it must reach out"
+        )
+
+
+sys.addaudithook(_network_audit)
+
+# ``-n auto`` resolves to this many xdist workers unless KT_TEST_WORKERS is set.
+LOCAL_TEST_WORKERS = 16
+MAX_TEST_WORKERS = 64
+_E2E_DIR = _ROOT / "tests" / "e2e"
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_xdist_auto_num_workers(config):
+    """Worker count for ``-n auto``: ``KT_TEST_WORKERS``, else min(16, cpus), cap 64."""
+    raw = os.environ.get("KT_TEST_WORKERS", "").strip()
+    count = int(raw) if raw else min(LOCAL_TEST_WORKERS, os.cpu_count() or 1)
+    return max(0, min(count, MAX_TEST_WORKERS))
+
+
+def pytest_collection_modifyitems(config, items):
+    """Run the e2e tier as one serial group; its journeys share real clusters."""
+    for item in items:
+        if Path(str(item.path)).is_relative_to(_E2E_DIR):
+            item.add_marker(pytest.mark.xdist_group("e2e"))
 
 
 @pytest.fixture(autouse=True)
@@ -49,7 +131,7 @@ def isolate_global_state():
     """Snapshot every module-global registry used by the framework.
 
     Tests routinely mutate ``lifecycle._meta``, ``api.deps._service``,
-    ``llm.api_keys._resolver``, etc.  Without isolation a failure in
+    ``llm.profiles.api_keys._resolver``, etc.  Without isolation a failure in
     one test poisons the next; we've already had several "passes
     alone, fails in suite" episodes in the old suite.
     """
@@ -70,21 +152,22 @@ def isolate_global_state():
         pass
 
     try:
-        from kohakuterrarium.llm import api_keys
+        from kohakuterrarium.llm.profiles import api_keys
 
         snapshots["api_keys._resolver"] = getattr(api_keys, "_resolver", None)
     except Exception:
         pass
 
     try:
-        from kohakuterrarium.llm import codex_auth
+        from kohakuterrarium.llm.codex import auth as codex_auth
 
         snapshots["codex_auth._resolver"] = getattr(codex_auth, "_resolver", None)
     except Exception:
         pass
 
     try:
-        from kohakuterrarium.llm import backends, preset_store
+        from kohakuterrarium.llm.profiles import backends
+        from kohakuterrarium.llm.presets import store as preset_store
 
         snapshots["preset_store._remote_presets"] = dict(preset_store._remote_presets)
         snapshots["backends._remote_backends"] = dict(backends._remote_backends)
@@ -103,21 +186,22 @@ def isolate_global_state():
         pass
 
     try:
-        from kohakuterrarium.llm import api_keys
+        from kohakuterrarium.llm.profiles import api_keys
 
         api_keys._resolver = snapshots.get("api_keys._resolver")
     except Exception:
         pass
 
     try:
-        from kohakuterrarium.llm import codex_auth
+        from kohakuterrarium.llm.codex import auth as codex_auth
 
         codex_auth._resolver = snapshots.get("codex_auth._resolver")
     except Exception:
         pass
 
     try:
-        from kohakuterrarium.llm import backends, preset_store
+        from kohakuterrarium.llm.profiles import backends
+        from kohakuterrarium.llm.presets import store as preset_store
 
         preset_store._remote_presets.clear()
         preset_store._remote_presets.update(
@@ -127,29 +211,6 @@ def isolate_global_state():
         backends._remote_backends.update(snapshots.get("backends._remote_backends", {}))
     except Exception:
         pass
-
-
-@pytest.fixture
-def tmp_session_dir(tmp_path, monkeypatch):
-    """Override the session-dir resolver to a per-test tmpdir.
-
-    Several modules read ``~/.kohakuterrarium/sessions`` at import or
-    runtime — this fixture redirects so tests never touch real user
-    state.
-    """
-    target = tmp_path / "sessions"
-    target.mkdir()
-    monkeypatch.setenv("KOHAKUTERRARIUM_SESSION_DIR", str(target))
-    return target
-
-
-@pytest.fixture
-def tmp_config_dir(tmp_path, monkeypatch):
-    """Override the config dir likewise."""
-    target = tmp_path / "config"
-    target.mkdir()
-    monkeypatch.setenv("KOHAKUTERRARIUM_CONFIG_DIR", str(target))
-    return target
 
 
 # Make Windows-locale issues go away — every test runs UTF-8.
@@ -173,6 +234,14 @@ def pytest_configure(config):
             config.option.timeout_method = "signal"
         except Exception:
             pass
+    config.addinivalue_line(
+        "markers",
+        "real_llm_provider: build real provider classes (against fakes); "
+        "lifts the LLM seam and the real-provider block",
+    )
+    config.addinivalue_line(
+        "markers", "allow_network: lift the non-loopback network block"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -209,6 +278,36 @@ def _default_isolated_config_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """Give every test a private home and temp root under a uuid-named folder.
+
+    HOME / USERPROFILE / XDG dirs and TMP / TEMP / TMPDIR (inherited by child
+    processes) plus ``tempfile.tempdir`` point inside it, so concurrent workers
+    and concurrent CI jobs never share a path. The folder sits beside, not
+    inside, the test's ``tmp_path``.
+    """
+    root = tmp_path_factory.mktemp(f"kt-{uuid.uuid4().hex[:12]}", numbered=False)
+    home = root / "home"
+    temp = root / "tmp"
+    home.mkdir()
+    temp.mkdir()
+    for name in ("HOME", "USERPROFILE"):
+        monkeypatch.setenv(name, str(home))
+    for name, sub in (
+        ("XDG_CONFIG_HOME", ".config"),
+        ("XDG_DATA_HOME", ".local/share"),
+        ("XDG_STATE_HOME", ".local/state"),
+        ("XDG_CACHE_HOME", ".cache"),
+    ):
+        monkeypatch.setenv(name, str(home / sub))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.setenv(name, str(temp))
+    monkeypatch.setattr(tempfile, "tempdir", str(temp))
+    return root
+
+
+@pytest.fixture(autouse=True)
 def _no_real_provider_login(monkeypatch):
     """Make a test fail loudly instead of opening a real provider login.
 
@@ -219,8 +318,8 @@ def _no_real_provider_login(monkeypatch):
     async def _refuse(*args, **kwargs):
         raise AssertionError("a test tried to start a real provider login")
 
-    monkeypatch.setattr("kohakuterrarium.llm.codex_auth.oauth_login", _refuse)
-    monkeypatch.setattr("kohakuterrarium.llm.codex_provider.oauth_login", _refuse)
+    monkeypatch.setattr("kohakuterrarium.llm.codex.auth.oauth_login", _refuse)
+    monkeypatch.setattr("kohakuterrarium.llm.codex.provider.oauth_login", _refuse)
 
 
 @pytest.fixture(autouse=True)
@@ -232,3 +331,23 @@ def _no_inherited_provider_keys(monkeypatch):
     """
     for name in PROVIDER_KEY_MAP.values():
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _llm_seam(request, monkeypatch):
+    """Route every provider factory to ``ScriptedLLM`` and refuse real providers.
+
+    ``@pytest.mark.real_llm_provider`` lifts both for a test that builds
+    provider classes against fake transports.
+    """
+    if request.node.get_closest_marker("real_llm_provider") is None:
+        install_llm_seam(monkeypatch)
+        forbid_real_providers(monkeypatch.setattr)
+
+
+@pytest.fixture(autouse=True)
+def _block_network(request):
+    """Block non-loopback sockets unless the test is marked ``allow_network``."""
+    _NETWORK_GUARD["blocked"] = request.node.get_closest_marker("allow_network") is None
+    yield
+    _NETWORK_GUARD["blocked"] = False

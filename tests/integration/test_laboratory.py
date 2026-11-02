@@ -13,8 +13,14 @@ failure, push detection down into a unit test FIRST, then fix.
 import asyncio
 
 import pytest
+from fastapi import WebSocketDisconnect
 
 from kohakuterrarium.api.routes.identity.grok import grok_usage
+from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.studio.sessions.creature.subagents import (
+    read_subagent_conversation_async,
+    send_to_subagent,
+)
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.laboratory.config import ClientConfig, HostConfig
@@ -24,7 +30,7 @@ from kohakuterrarium.laboratory._internal.client import (
     RequestTimeoutError,
 )
 from kohakuterrarium.laboratory._internal.host import HostEngine
-from kohakuterrarium.laboratory._internal.transport_inproc import InProcTransport
+from kohakuterrarium.laboratory._internal.transport.inproc import InProcTransport
 from kohakuterrarium.laboratory.adapters import (
     StudioCatalogAdapter,
     StudioDeployAdapter,
@@ -41,16 +47,17 @@ from kohakuterrarium.laboratory.adapters import (
 )
 from kohakuterrarium.laboratory.adapters._worker_session import WorkerSessionAttacher
 from kohakuterrarium.laboratory.identity_cache import IdentityCache
-from kohakuterrarium.llm.api_keys import (
+from kohakuterrarium.llm.profiles.api_keys import (
     clear_api_key_resolver,
     register_api_key_resolver,
 )
 from kohakuterrarium.studio.nodes import NodeMap
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.studio.sessions import lifecycle as session_lifecycle
-from kohakuterrarium.session.readonly import read_session_meta
-from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
-from kohakuterrarium.studio.catalog.packages import install_package_op
+from kohakuterrarium.session.readonly.metadata import read_session_meta
+from kohakuterrarium.terrarium.graph.manifest import MANIFEST_KEY
+from kohakuterrarium.studio.attach.io import attach_io
+from kohakuterrarium.studio.catalog.packages.packages import install_package_op
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
@@ -61,10 +68,10 @@ from kohakuterrarium.terrarium.drive.errors import (
     DrivePermissionError,
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
-from kohakuterrarium.terrarium.drive.multi_node import DriveHomeUnavailableError
+from kohakuterrarium.terrarium.drive.multi_node.homes import DriveHomeUnavailableError
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
-from kohakuterrarium.terrarium.multi_node_service import MultiNodeTerrariumService
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.multi_node.service import MultiNodeTerrariumService
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
 from tests.helpers.grok_usage_script import (
@@ -81,6 +88,11 @@ from tests.helpers.grok_usage_script import (
 pytestmark = pytest.mark.timeout(60)
 
 LAB_TOKEN = "lab-integration-token"
+
+
+class _ForkingLLM(ScriptedLLM):
+    def fork(self, **kwargs):
+        return _ForkingLLM(self.script)
 
 
 def _write_creature_config(root, name: str) -> str:
@@ -125,6 +137,19 @@ def scripted_llm(monkeypatch):
                 response="bravo got it",
                 match="hello-from-alpha",
             ),
+            ScriptEntry(
+                response=(
+                    "[/send_channel]\n"
+                    "@@channel=attach-missing-ch\n"
+                    "@@message=probe\n"
+                    "[send_channel/]"
+                ),
+                match="attach probe",
+            ),
+            ScriptEntry(
+                response="attach-recovered-reply",
+                match="attach-missing-ch",
+            ),
             ScriptEntry(response="generic-reply-1"),
             ScriptEntry(response="generic-reply-2"),
             ScriptEntry(response="generic-reply-3"),
@@ -135,11 +160,47 @@ def scripted_llm(monkeypatch):
     }
 
     def _create(config, llm=None):
-        return ScriptedLLM(holder["script"])
+        return _ForkingLLM(holder["script"])
 
     monkeypatch.setattr(_bootstrap_llm_mod, "create_llm_provider", _create)
     monkeypatch.setattr(_agent_init_mod, "create_llm_provider", _create)
     return holder
+
+
+class _AttachWebSocket:
+    """Controller-side WebSocket double for driving ``attach_io``."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self._inbound: asyncio.Queue = asyncio.Queue()
+        self._arrived = asyncio.Event()
+
+    def push(self, frame: dict) -> None:
+        self._inbound.put_nowait(frame)
+
+    def disconnect(self) -> None:
+        self._inbound.put_nowait(None)
+
+    async def send_json(self, frame: dict) -> None:
+        self.sent.append(frame)
+        self._arrived.set()
+
+    async def receive_json(self) -> dict:
+        frame = await self._inbound.get()
+        if frame is None:
+            raise WebSocketDisconnect()
+        return frame
+
+    async def wait_for(self, predicate, timeout: float = 10.0) -> dict:
+        async def _scan() -> dict:
+            while True:
+                for frame in self.sent:
+                    if predicate(frame):
+                        return frame
+                self._arrived.clear()
+                await self._arrived.wait()
+
+        return await asyncio.wait_for(_scan(), timeout)
 
 
 def _attach_worker_stack(engine: Terrarium, client: ClientConnector, session_dir):
@@ -272,7 +333,7 @@ class TestLaboratoryMultiNodeService:
             # The service routes recipe spawn through the host engine.
             # In lab-host mode the API endpoint 501s, but the host engine
             # itself can still load + apply a recipe — exercising
-            # terrarium/recipe.py, terrarium/root.py, terrarium/config.py.
+            # terrarium/recipe/loader.py, terrarium/root.py, terrarium/config.py.
             from pathlib import Path
             from kohakuterrarium.terrarium.config import (
                 ChannelConfig,
@@ -336,7 +397,7 @@ class TestLaboratoryMultiNodeService:
             assert len(creatures) == 0
 
             # ── 5. add_creature on w1 (path-form via studio.deploy) ──
-            from kohakuterrarium.core.config import load_agent_config
+            from kohakuterrarium.core.config.load import load_agent_config
 
             with pytest.raises(KeyError, match="Package not installed"):
                 await service.add_creature("@missing/creatures/general", on_node="w1")
@@ -383,6 +444,61 @@ class TestLaboratoryMultiNodeService:
             with pytest.raises(ValueError):
                 await service.chat_history_page(
                     alpha_info.creature_id, before="malformed"
+                )
+
+            snapshot = await service.capture_context(alpha.creature_id)
+            assert snapshot.messages == alpha.capture_context().messages
+            assert snapshot.provenance == w1_engine.capture_context(alpha).provenance
+            parent_messages = alpha.agent.controller.conversation.to_messages()
+            side = await service.execute_command(
+                alpha.creature_id, "btw", "private worker question"
+            )
+            assert side["error"] is None
+            side_id = side["data"]["job_id"]
+            await alpha.agent.subagent_manager.wait_for(side_id)
+            side_read = await read_subagent_conversation_async(
+                service, "cluster-display-id", alpha.creature_id, job_id=side_id
+            )
+            assert side_read["session_id"] == "cluster-display-id"
+            assert side_read["meta"]["audience"] == "user"
+            assert side_read["can_receive"] is True
+            assert "private worker question" in str(side_read["messages"])
+            sent = await send_to_subagent(
+                service,
+                alpha.graph_id,
+                alpha.creature_id,
+                "fork",
+                "private followup",
+                job_id=side_id,
+            )
+            assert sent["job_id"] == side_id
+            await alpha.agent.subagent_manager.wait_for(side_id)
+            saved = alpha.agent.session_store.find_subagent_run(
+                side_id, parent=alpha.agent.subagent_manager._parent_name
+            )
+            assert saved["meta"]["audience"] == "user"
+            alpha.agent.subagent_manager._jobs.pop(side_id)
+            restored = await service.read_subagent_conversation(
+                alpha.creature_id, job_id=side_id
+            )
+            assert restored["live"] is False
+            assert restored["can_receive"] is True
+            assert "private followup" in str(restored["messages"])
+            await service.send_to_subagent(
+                alpha.creature_id, "fork", "reopened followup", job_id=side_id
+            )
+            await alpha.agent.subagent_manager.wait_for(side_id)
+            assert alpha.agent.controller.conversation.to_messages() == parent_messages
+            task_id = await alpha.agent.subagent_manager.spawn(
+                "fork", "ordinary task", background=False
+            )
+            with pytest.raises(ConflictError):
+                await service.send_to_subagent(
+                    alpha.creature_id, "fork", "must not restart", job_id=task_id
+                )
+            with pytest.raises(KeyError):
+                await service.read_subagent_conversation(
+                    alpha.creature_id, job_id="absent"
                 )
 
             b_cfg = load_agent_config(cfg_bravo)
@@ -467,19 +583,26 @@ class TestLaboratoryMultiNodeService:
             assert status is not None
             assert status.get("creature_id") == alpha_info.creature_id
 
-            # ── 14. stop_creature → start_creature round-trip ──
+            # ── 14. stop_creature → user input on the worker starts it again ──
+            async def _bravo_running(expected: bool) -> bool:
+                for _ in range(20):
+                    s = await service.creature_status(bravo_info.creature_id)
+                    if s and s.get("running") is expected:
+                        return True
+                    await asyncio.sleep(0.05)
+                return False
+
             await service.stop_creature(bravo_info.creature_id)
-            for _ in range(20):
-                s = await service.creature_status(bravo_info.creature_id)
-                if s and s.get("running") is False:
-                    break
-                await asyncio.sleep(0.05)
+            assert await _bravo_running(False)
+            await service.inject_input(bravo_info.creature_id, "wake up", source="test")
+            assert (await service.creature_status(bravo_info.creature_id))["running"]
+            await service.stop_creature(bravo_info.creature_id)
+            assert await _bravo_running(False)
+            async for _ in service.chat(bravo_info.creature_id, "still there?"):
+                pass
+            assert (await service.creature_status(bravo_info.creature_id))["running"]
             await service.start_creature(bravo_info.creature_id)
-            for _ in range(20):
-                s = await service.creature_status(bravo_info.creature_id)
-                if s and s.get("running") is True:
-                    break
-                await asyncio.sleep(0.05)
+            assert await _bravo_running(True)
 
             # ── 15. disconnect ──
             disc = await service.disconnect(
@@ -500,8 +623,8 @@ class TestLaboratoryMultiNodeService:
             # Create two isolated host-side creatures with attached
             # session stores, then connect them so the engine
             # auto-merges + the SessionCoordinator copies / preserves
-            # session state.  Hits terrarium/session_coord.py paths.
-            from kohakuterrarium.core.config import load_agent_config
+            # session state.  Hits terrarium/session/coord.py paths.
+            from kohakuterrarium.core.config.load import load_agent_config
             from kohakuterrarium.session.store import SessionStore
             from pathlib import Path as _P
 
@@ -551,6 +674,38 @@ class TestLaboratoryMultiNodeService:
                 import traceback
 
                 traceback.print_exc()
+
+            # ── 16c. Studio attaches to remote alpha; a tool call fails ──
+            # Driven like api/ws/io.py. The tool_error frame's string ``error``
+            # field is payload: the turn's reply and idle must still arrive.
+            attach_ws = _AttachWebSocket()
+            attach_task = asyncio.create_task(
+                attach_io(
+                    attach_ws, service, alpha_info.graph_id, alpha_info.creature_id
+                )
+            )
+            try:
+                attach_ws.push({"type": "input", "content": "attach probe"})
+                idle = await attach_ws.wait_for(lambda f: f.get("type") == "idle")
+                tool_error = next(
+                    f for f in attach_ws.sent if f.get("type") == "tool_error"
+                )
+                assert "attach-missing-ch" in tool_error["error"]
+                after_error = attach_ws.sent[
+                    attach_ws.sent.index(tool_error) : attach_ws.sent.index(idle)
+                ]
+                reply = "".join(
+                    f.get("content", "") for f in after_error if f.get("type") == "text"
+                )
+                assert "attach-recovered-reply" in reply
+                attach_ws.disconnect()
+                with pytest.raises(WebSocketDisconnect):
+                    await asyncio.wait_for(attach_task, timeout=5.0)
+            finally:
+                if not attach_task.done():
+                    attach_ws.disconnect()
+                    attach_task.cancel()
+                    await asyncio.gather(attach_task, return_exceptions=True)
 
             # ── 17. cross-node output wiring via the service Protocol ──
             # The TerrariumOutputWireAdapter routes this through the
@@ -937,9 +1092,9 @@ class TestLaboratoryDeepWorkflows:
         """
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
         from kohakuterrarium.session.store import SessionStore
-        from kohakuterrarium.core.config import load_agent_config
+        from kohakuterrarium.core.config.load import load_agent_config
         from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
 
         sessions_dir = tmp_path / "sess"
@@ -1063,7 +1218,7 @@ class TestLaboratoryModulesViaAgent:
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1204,7 +1359,7 @@ class TestLaboratoryModulesViaAgent:
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1289,7 +1444,7 @@ class TestLaboratoryModulesViaAgent:
     async def test_output_router_state_machine(self, tmp_path):
         """OutputRouter routes parse events to the right output module.
         Mirrors test_modules.py::test_output_router_state_machine."""
-        from kohakuterrarium.modules.output.router import OutputRouter
+        from kohakuterrarium.modules.output.router.router import OutputRouter
         from kohakuterrarium.testing.output import OutputRecorder
 
         from kohakuterrarium.modules.output.event import OutputEvent
@@ -1315,13 +1470,13 @@ class TestLaboratoryModulesViaAgent:
         self, tmp_path, monkeypatch
     ):
         """Deep chat workflow exercising core/agent_messages,
-        core/conversation, core/tool_output, core/controller,
+        core/conversation, core/tools/output, core/controller,
         core/agent_handlers, core/agent_tools through multiple tool
         calls + tool result feedback into the controller."""
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1448,7 +1603,7 @@ class TestLaboratoryModulesViaAgent:
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.core.agent import Agent
-        from kohakuterrarium.core.config_types import (
+        from kohakuterrarium.core.config.types import (
             AgentConfig,
             InputConfig,
             OutputConfig,
@@ -1548,18 +1703,18 @@ class TestLaboratoryAdapterDirect:
         from kohakuterrarium.laboratory.config import ClientConfig, HostConfig
         from kohakuterrarium.laboratory._internal.client import ClientConnector
         from kohakuterrarium.laboratory._internal.host import HostEngine
-        from kohakuterrarium.laboratory._internal.transport_inproc import (
+        from kohakuterrarium.laboratory._internal.transport.inproc import (
             InProcTransport,
         )
         from kohakuterrarium.laboratory.adapters import (
             TerrariumEventsAdapter,
             TerrariumRuntimeAdapter,
         )
-        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.engine.engine import Terrarium
         from kohakuterrarium.testing.llm import ScriptedLLM
         from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
         from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
-        from kohakuterrarium.core.config import load_agent_config
+        from kohakuterrarium.core.config.load import load_agent_config
 
         cdir = tmp_path / "evt_creature"
         cdir.mkdir(parents=True, exist_ok=True)
@@ -1599,7 +1754,10 @@ class TestLaboratoryAdapterDirect:
             client = ClientConnector(cfg, InProcTransport())
             engine = Terrarium(session_dir=str(tmp_path / "evt-sess"))
             await client.start()
-            TerrariumRuntimeAdapter(engine, client)
+            attacher = WorkerSessionAttacher(
+                engine, client, session_dir=tmp_path / "evt-sess"
+            )
+            TerrariumRuntimeAdapter(engine, client, session_attacher=attacher)
             TerrariumEventsAdapter(engine, client)
 
             for _ in range(20):
@@ -1610,7 +1768,7 @@ class TestLaboratoryAdapterDirect:
             try:
                 # Build the MultiNodeTerrariumService so the demux is
                 # constructed once and used by every RemoteTerrariumService.
-                from kohakuterrarium.terrarium.multi_node_service import (
+                from kohakuterrarium.terrarium.multi_node.service import (
                     MultiNodeTerrariumService,
                 )
 
@@ -1634,6 +1792,63 @@ class TestLaboratoryAdapterDirect:
                 # forwards provider chunks verbatim rather than buffering
                 # them through the text parser.
                 assert "streamed-reply" in "".join(chunks), f"got chunks: {chunks!r}"
+                worker = engine.get_creature(info.creature_id)
+                missing = [
+                    {"type": "text", "text": "keep the admitted branch"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": (tmp_path / "missing.png").as_uri()},
+                    },
+                ]
+                store = worker.agent.session_store
+                user_index = next(
+                    index
+                    for index, message in enumerate(
+                        worker.agent.controller.conversation.get_messages()
+                    )
+                    if message.role == "user"
+                )
+                calls_before = worker.agent.llm.call_count
+                edited = await remote.edit_message(
+                    info.creature_id, user_index, missing, turn_index=1
+                )
+                regenerated = await remote.regenerate(info.creature_id, turn_index=1)
+                assert edited["request_id"] != regenerated["request_id"]
+                assert edited["branch_id"] < regenerated["branch_id"]
+                for result in (edited, regenerated):
+                    assert result["status"] == "completed"
+                    assert (
+                        "Required local media is unavailable"
+                        in result["execution_error"]
+                    )
+                    admitted = next(
+                        event
+                        for event in store.get_events(worker.config.name)
+                        if event["type"] == "user_message"
+                        and event.get("request_id") == result["request_id"]
+                    )
+                    assert admitted["branch_id"] == result["branch_id"]
+                    assert admitted["content"] == missing
+                assert worker.agent._branch_id == regenerated["branch_id"]
+                assert worker.agent._branch_execution_error == (
+                    regenerated["request_id"],
+                    regenerated["execution_error"],
+                )
+                assert worker.agent.llm.call_count == calls_before
+                repaired = await remote.edit_message(
+                    info.creature_id,
+                    user_index,
+                    "recovered",
+                    turn_index=1,
+                    request_id="supplied-recovery",
+                )
+                assert repaired["request_id"] == "supplied-recovery"
+                assert "execution_error" not in repaired
+                assert worker.agent.llm.call_count == calls_before + 1
+                assert any(
+                    message.get("content") == "recovered"
+                    for message in worker.agent.llm.call_log[-1]
+                )
                 await _safe(coord.shutdown())
             finally:
                 await _safe(client.stop())

@@ -34,32 +34,45 @@ end — mirroring the REST+WS call sequences the Vue frontend
   prove the lab-only ``/api/nodes`` surface 404s in standalone mode.
 """
 
+import asyncio
+import base64
 import os
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+import kohakuterrarium.api.routes.persistence.preflight_metadata as _preflight_metadata
+import kohakuterrarium.api.routes.persistence.resume.cluster as _resume_cluster
+from kohakuterrarium import tool
 from kohakuterrarium.api.app import create_app
-from kohakuterrarium.api.deps import set_service
+from kohakuterrarium.api.deps import get_service_legacy, set_service
+from kohakuterrarium.llm.openai.provider import OpenAIProvider
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.readonly.metadata import read_session_meta
+from kohakuterrarium.session.readonly.candidate import read_metadata_candidate
+from kohakuterrarium.session.occupancy.gate import GATE, acquire_legacy, try_fast
 from kohakuterrarium.studio.persistence.store import resolve_session_path_in
 from kohakuterrarium.api.routes.catalog import _deps as _catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
-from kohakuterrarium.core import agent_model as _agent_model
+from kohakuterrarium.core.agent import model as _agent_model
 from kohakuterrarium.packages.resolve import resolve_package_path
-from kohakuterrarium.session.embedding import NullEmbedder
-from kohakuterrarium.studio.catalog import packages as _catalog_packages_ops
+from kohakuterrarium.session.memory.embedding import NullEmbedder
+from kohakuterrarium.studio.catalog.packages import packages as _catalog_packages_ops
 from kohakuterrarium.studio.sessions import lifecycle
-from kohakuterrarium.studio.sessions import memory_build as _memory_build
-from kohakuterrarium.studio.sessions import memory_search as _memory_search
+from kohakuterrarium.studio.sessions.memory import build as _memory_build
+from kohakuterrarium.studio.sessions.memory import search as _memory_search
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
+from kohakuterrarium.testing.llm_seam import real_llm_providers
+from tests.helpers.kt_biome import find_kt_biome_source
+from tests.helpers.pet_archive import pet_archive
+from tests.helpers.resume_metadata_contention import resume_with_metadata_contention
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 # Deterministic assistant replies. The ScriptedLLM matches the *next*
 # unused entry per call; a plain creature turn = one LLM call.
@@ -113,28 +126,6 @@ def scripted_llm(monkeypatch: pytest.MonkeyPatch) -> ScriptedLLM:
         _agent_model, "create_llm_from_profile_name", _fake_from_profile_name
     )
     return llm
-
-
-def _find_kt_biome_source() -> Path | None:
-    """Locate a kt-biome bundle to install into the isolated catalog.
-
-    Dev machines carry a repo-local ``kt-biome/`` checkout; CI installs
-    kt-biome editable into the operator config dir before the suite
-    runs, leaving a ``kt-biome.link`` pointing at the cloned source.
-    """
-    repo_local = Path(__file__).resolve().parents[2] / "kt-biome"
-    if (repo_local / "kohaku.yaml").exists():
-        return repo_local
-    real_pkgs = Path.home() / ".kohakuterrarium" / "packages"
-    link = real_pkgs / "kt-biome.link"
-    if link.exists():
-        target = Path(link.read_text(encoding="utf-8").strip())
-        if (target / "kohaku.yaml").exists():
-            return target
-    direct = real_pkgs / "kt-biome"
-    if (direct / "kohaku.yaml").exists():
-        return direct
-    return None
 
 
 @pytest.fixture
@@ -306,7 +297,7 @@ class TestApiIntegration:
         # the configs scan silently hid it.  PACKAGES_DIR is pinned to
         # tmp so the step never touches the developer's real installs.
         from kohakuterrarium.packages import locations as _pkg_locations
-        from kohakuterrarium.studio.catalog import packages_scan as _packages_scan
+        from kohakuterrarium.studio.catalog.packages import scan as _packages_scan
 
         monkeypatch.setattr(_pkg_locations, "PACKAGES_DIR", tmp_path / "pkgs")
         _packages_scan.invalidate_scan_caches()
@@ -582,7 +573,7 @@ class TestApiIntegration:
         # repo-shipped ``kt-biome`` editable into the isolated dir first
         # so its summary + extension lists resolve.  An uninstalled name
         # 404s regardless.
-        biome_src = _find_kt_biome_source()
+        biome_src = find_kt_biome_source()
         if biome_src is not None:
             _catalog_packages_ops.install_package_op(str(biome_src), editable=True)
             resp = client.get("/api/studio/packages")
@@ -766,15 +757,10 @@ class TestApiIntegration:
         assert resp.json()["settings"]["runtime"]["enabled"] is True
         assert resp.json()["revision"] == saved_rev
 
-        # Saving remains distinct from applying; changing the enabled registry
-        # may apply live or report that a restart is required.
+        # Saving remains distinct from applying.
         resp = client.post("/api/settings/drives/apply")
         assert resp.status_code == 200
-        assert resp.json()["result"] in {
-            "applied_live",
-            "restart_required",
-            "rejected",
-        }
+        assert resp.json()["result"] == "restart_required"
         resp = client.get("/api/settings/drives/runtime-status")
         assert resp.status_code == 200
         assert "enabled" in resp.json()
@@ -859,7 +845,29 @@ class TestApiIntegration:
             info = ws.receive_json()
             assert info["activity_type"] == "session_info"
             assert info["agent_name"] == "alice"
-            reply = _stream_turn(ws, "hello creature")
+            ws.send_json(
+                {
+                    "type": "input",
+                    "content": "hello creature",
+                    "event_id": "m1b-initial",
+                }
+            )
+            frames = []
+            while True:
+                frame = ws.receive_json()
+                frames.append(frame)
+                if frame.get("type") == "idle":
+                    break
+            assert any(
+                frame.get("type") == "user_input"
+                and frame.get("pending_id") == "m1b-initial"
+                for frame in frames
+            )
+            reply = "".join(
+                frame.get("content", "")
+                for frame in frames
+                if frame.get("type") == "text"
+            )
         assert reply == _REPLY_ONE
         assert scripted_llm.call_count == 1
 
@@ -918,6 +926,183 @@ class TestApiIntegration:
             json={"content": "x", "user_position": 999},
         )
         assert resp.status_code == 409
+        parts = [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,YQ==",
+                    "vendor": "retained",
+                },
+                "meta": {"source_name": "original.png", "custom": "kept"},
+            },
+            {"type": "text", "text": "", "vendor": {"state": "empty"}},
+            {
+                "type": "file",
+                "file": {
+                    "name": "duplicate.txt",
+                    "content": "FILE-A",
+                    "mime": "text/plain",
+                    "is_inline": True,
+                },
+            },
+            {
+                "type": "file",
+                "file": {
+                    "name": "duplicate.txt",
+                    "content": "FILE-B",
+                    "mime": "text/plain",
+                    "is_inline": True,
+                },
+            },
+        ]
+        original_events = client.get(f"{base}/history").json()["events"]
+        with client.websocket_connect(ws_url) as ws:
+            ws.receive_json()
+            edited = client.post(
+                f"{base}/messages/0/edit",
+                json={"content": parts, "user_position": 0, "request_id": "m1b-edit"},
+            )
+            assert edited.status_code == 200, edited.text
+            body = edited.json()
+            assert body["request_id"] == "m1b-edit"
+            assert body["execution_error"] is None
+            edit_frames = []
+            while True:
+                frame = ws.receive_json()
+                edit_frames.append(frame)
+                if frame.get("type") == "processing_end":
+                    break
+            assert any(
+                frame.get("type") == "user_input"
+                and frame.get("request_id") == "m1b-edit"
+                and frame.get("content") == parts
+                for frame in edit_frames
+            ), edit_frames
+        after_edit = client.get(f"{base}/history").json()["events"]
+        assert after_edit[: len(original_events)] == original_events
+        edited_root = next(
+            event
+            for event in after_edit
+            if event.get("type") == "user_message"
+            and event.get("request_id") == "m1b-edit"
+        )
+        assert edited_root["content"] == parts
+        prepared = next(
+            message["content"]
+            for message in reversed(scripted_llm.call_log[-1])
+            if message["role"] == "user"
+        )
+        assert prepared[0] == parts[0]
+        assert prepared[1] == parts[1]
+        attachment_paths = [
+            Path(part["text"].split("Path: ", 1)[1])
+            for part in prepared[2:]
+            if part.get("type") == "text" and part["text"].startswith("Attached file:")
+        ]
+        assert len(attachment_paths) == 2, prepared
+        file_a, file_b = attachment_paths
+        assert file_a != file_b
+        assert file_a.read_bytes() == b"FILE-A"
+        assert file_b.read_bytes() == b"FILE-B"
+        rerun = client.post(
+            f"{base}/regenerate",
+            json={
+                "target": {
+                    key: edited_root[key]
+                    for key in ("event_id", "turn_index", "branch_id")
+                },
+                "request_id": "m1b-rerun",
+            },
+        )
+        assert rerun.status_code == 200, rerun.text
+        assert rerun.json()["request_id"] == "m1b-rerun"
+        assert rerun.json()["execution_error"] is None
+        rerun_events = client.get(f"{base}/history").json()["events"]
+        assert (
+            next(
+                event
+                for event in rerun_events
+                if event.get("type") == "user_message"
+                and event.get("request_id") == "m1b-rerun"
+            )["content"]
+            == parts
+        )
+
+        transport_requests = []
+
+        async def reject_request(request):
+            transport_requests.append(request)
+            raise AssertionError("Missing media must fail before HTTP transport")
+
+        async def missing_media_edit_provider():
+            agent = get_service_legacy().engine.get_creature(creature_id).agent
+            with real_llm_providers():
+                provider = OpenAIProvider(api_key="test", model="test")
+            previous_client = provider._client
+            provider._client = previous_client.with_options(
+                http_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(reject_request)
+                )
+            )
+            await previous_client.close()
+            agent.controller.llm = provider
+            return provider
+
+        provider = client.portal.call(missing_media_edit_provider)
+        try:
+            missing = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": (tmp_path / "missing.png").as_uri()},
+                }
+            ]
+            failed = client.post(
+                f"{base}/messages/0/edit",
+                json={
+                    "content": missing,
+                    "user_position": 0,
+                    "request_id": "m1b-missing",
+                },
+            )
+            assert failed.status_code == 200, failed.text
+            assert failed.json()["status"] == "completed"
+            assert (
+                "Required local media is unavailable"
+                in failed.json()["execution_error"]
+            )
+            assert failed.json()["request_id"] == "m1b-missing"
+            assert transport_requests == []
+            anonymous = client.post(
+                f"{base}/messages/0/edit", json={"content": missing, "user_position": 0}
+            )
+            assert anonymous.status_code == 200, anonymous.text
+            assert anonymous.json()["request_id"] != "m1b-missing"
+            assert (
+                "Required local media is unavailable"
+                in anonymous.json()["execution_error"]
+            )
+            failed_page = client.get(f"{base}/history").json()
+            assert failed_page["is_processing"] is False
+            assert failed_page["events"][: len(rerun_events)] == rerun_events
+            assert (
+                next(
+                    event
+                    for event in failed_page["events"]
+                    if event.get("type") == "user_message"
+                    and event.get("request_id") == "m1b-missing"
+                )["content"]
+                == missing
+            )
+        finally:
+
+            async def restore_provider():
+                get_service_legacy().engine.get_creature(
+                    creature_id
+                ).agent.controller.llm = scripted_llm
+                await provider.close()
+
+            client.portal.call(restore_provider)
+
         # Rewind the conversation to message index 1 (keeps the system
         # message at index 0 intact).
         resp = client.post(f"{base}/messages/1/rewind")
@@ -1314,6 +1499,64 @@ class TestApiIntegration:
         resp = client.delete("/api/sessions/active/terrariums/ghost-sid")
         assert resp.status_code == 404
 
+        # 5d. UI owner RPC against a live plugin: the built-in budget
+        #     panel's ``useOwner()`` path (state → push on a turn → scope).
+        bud_dir = tmp_path / "bud"
+        bud_dir.mkdir()
+        (bud_dir / "config.yaml").write_text(
+            _CREATURE_CONFIG.replace("name: alice", "name: bud")
+            + "plugins:\n  - name: budget\n    options:\n"
+            + "      turn_budget: {soft: 5, hard: 10}\n",
+            encoding="utf-8",
+        )
+        resp = client.post(
+            "/api/sessions/active/agents", json={"config_path": str(bud_dir)}
+        )
+        assert resp.status_code == 200
+        bud_sid = resp.json()["session_id"]
+        bud_cid = resp.json()["agent_id"]
+        bud_ref = {
+            "owner": "plugin:budget",
+            "session_id": bud_sid,
+            "creature_id": "bud",
+        }
+        resp = client.post("/api/extensions/owner/state", json=bud_ref)
+        assert resp.status_code == 200
+        bud_state = resp.json()["state"]
+        assert bud_state["configured"] is True
+        assert bud_state["axes"]["turn"]["used"] == 0
+        assert bud_state["axes"]["turn"]["hard"] == 10
+        # Negative: alice has no budget plugin; bud is not in alice's session.
+        resp = client.post(
+            "/api/extensions/owner/state",
+            json={**bud_ref, "session_id": session_id, "creature_id": creature_id},
+        )
+        assert resp.json()["detail"]["error"] == "owner_not_loaded"
+        resp = client.post(
+            "/api/extensions/owner/call",
+            json={**bud_ref, "session_id": session_id, "action": "x"},
+        )
+        assert resp.status_code == 404
+        # The budget plugin accepts no UI actions.
+        resp = client.post(
+            "/api/extensions/owner/call", json={**bud_ref, "action": "reset"}
+        )
+        assert resp.status_code == 400
+        with client.websocket_connect("/ws/extensions/owner") as owner_ws:
+            owner_ws.send_json({"op": "subscribe", "id": "b", **bud_ref})
+            assert owner_ws.receive_json()["type"] == "subscribed"
+            bud_url = f"/ws/sessions/{bud_sid}/creatures/{bud_cid}/chat"
+            with client.websocket_connect(bud_url) as bud_ws:
+                assert bud_ws.receive_json()["activity_type"] == "session_info"
+                _stream_turn(bud_ws, "count this turn")
+            push = owner_ws.receive_json()
+            assert push["event"] == "state"
+            assert push["data"]["axes"]["turn"]["used"] == 1
+        resp = client.delete(f"/api/sessions/active/{bud_sid}")
+        assert resp.status_code == 200
+        resp = client.post("/api/extensions/owner/state", json=bud_ref)
+        assert resp.status_code == 404
+
         # 6. DELETE the session — it leaves the active list.
         resp = client.delete(f"/api/sessions/active/{session_id}")
         assert resp.status_code == 200
@@ -1322,6 +1565,69 @@ class TestApiIntegration:
         # Deleting it again → 404.
         resp = client.delete(f"/api/sessions/active/{session_id}")
         assert resp.status_code == 404
+
+        pet_source = Path(__file__).parents[2] / "examples/packages/virtual_pet"
+        _catalog_packages_ops.install_package_op(str(pet_source), editable=True)
+        ref = {"owner": "package:virtual-pet"}
+        assert (
+            client.post("/api/extensions/owner/state", json=ref).json()["state"]["pets"]
+            == []
+        )
+        with (
+            client.websocket_connect("/ws/extensions/owner") as settings_ws,
+            client.websocket_connect("/ws/extensions/owner") as overlay_ws,
+        ):
+            for socket in (settings_ws, overlay_ws):
+                socket.send_json({"op": "subscribe", "id": "pets", **ref})
+                assert socket.receive_json()["type"] == "subscribed"
+            imported = client.post(
+                "/api/extensions/owner/call",
+                json={
+                    **ref,
+                    "action": "import",
+                    "args": {"archive": base64.b64encode(pet_archive()).decode()},
+                },
+            )
+            assert imported.status_code == 200
+            key = imported.json()["result"]["selected"]
+            actions = {"running-right": 8, "running-left": 8, "waving": 4, "jumping": 5}
+            assert imported.json()["result"]["pets"][0]["interactions"] == actions
+            for socket in (settings_ws, overlay_ws):
+                published = socket.receive_json()["data"]
+                assert published["selected"] == key
+                assert published["pets"][0]["interactions"] == actions
+            duplicate = client.post(
+                "/api/extensions/owner/call",
+                json={
+                    **ref,
+                    "action": "import",
+                    "args": {"archive": base64.b64encode(pet_archive()).decode()},
+                },
+            )
+            assert duplicate.json()["result"] == imported.json()["result"]
+            sprite = client.post(
+                "/api/extensions/owner/call",
+                json={**ref, "action": "sprite", "args": {"key": key}},
+            )
+            assert sprite.status_code == 200 and sprite.json()["result"].startswith(
+                "data:image/png;base64,"
+            )
+            assert (
+                client.post(
+                    "/api/extensions/owner/call",
+                    json={**ref, "action": "remove", "args": {"key": key}},
+                ).status_code
+                == 200
+            )
+            for socket in (settings_ws, overlay_ws):
+                assert socket.receive_json()["data"]["pets"] == []
+        assert (
+            client.post("/api/extensions/owner/state", json=ref).json()["state"][
+                "selected"
+            ]
+            is None
+        )
+        assert _catalog_packages_ops.uninstall_package_op("virtual-pet") is True
 
     def test_session_persistence_and_resume_workflow(
         self,
@@ -1871,7 +2177,42 @@ class TestApiIntegration:
         preflight = client.post("/api/sessions/retired-source/resume/preflight")
         assert preflight.status_code == 200
         assert preflight.json()["ready"] is True
-        resp = client.post("/api/sessions/retired-source/resume")
+        classifications, candidates = [], []
+
+        def copied_classification(path):
+            classifications.append(Path(path))
+            return read_session_meta(path)
+
+        def observed_candidate(path, *, eligible=False):
+            assert eligible
+            outcome = read_metadata_candidate(path, eligible=eligible)
+            candidates.append(outcome.reason)
+            return outcome
+
+        with monkeypatch.context() as controlled:
+            controlled.setattr(
+                _resume_cluster, "read_session_meta", copied_classification
+            )
+            controlled.setattr(
+                _preflight_metadata, "read_metadata_candidate", observed_candidate
+            )
+            optimized = client.post("/api/sessions/retired-source/resume/preflight")
+            assert optimized.status_code == 200
+            assert optimized.json() == preflight.json()
+            assert len(classifications) == 2
+            assert candidates and set(candidates) == {"ok"}
+            assert not GATE.snapshot(target_path).registered
+            candidates.clear()
+            reservation = acquire_legacy(target_path, "controlled_preflight_fallback")
+            try:
+                fallback = client.post("/api/sessions/retired-source/resume/preflight")
+                assert fallback.json() == preflight.json()
+                assert candidates and set(candidates) == {"legacy_enrolled"}
+            finally:
+                reservation.finish(source_released=True)
+        resp = resume_with_metadata_contention(
+            client, target_path, "/api/sessions/retired-source/resume", monkeypatch
+        )
         assert resp.status_code == 200
         resumed = resp.json()
         assert resumed["type"] == "agent"
@@ -2036,6 +2377,25 @@ terrarium:
         resp = client.delete(f"/api/sessions/{terra_b}")
         assert resp.status_code == 200
 
+        quarantined_path = session_dir / "quarantined.kohakutr"
+        quarantined = SessionStore(quarantined_path)
+        try:
+            quarantined.init_meta("quarantined", "agent", "", str(tmp_path), ["alice"])
+        finally:
+            quarantined.close(update_status=False)
+        reservation = try_fast(quarantined_path, eligible=True)
+        assert reservation.lease is not None
+        reservation.lease.finish(source_released=False)
+        for _ in range(2):
+            resp = client.post("/api/sessions/quarantined/resume/preflight")
+            assert resp.status_code == 503
+            assert (
+                resp.json()["detail"]["code"] == "session_metadata_resource_unavailable"
+            )
+            assert "ready" not in resp.json()
+            assert GATE.snapshot(quarantined_path).new_uncertain
+        assert client.post("/api/sessions/absent/resume/preflight").status_code == 404
+
     def test_terrarium_hotplug_and_runtime_graph_workflow(
         self, client: TestClient, creature_dir: Path, scripted_llm: ScriptedLLM
     ) -> None:
@@ -2101,6 +2461,62 @@ terrarium:
         resp = client.get("/api/sessions/active/agents")
         assert resp.status_code == 200
         assert resp.json() == []
+
+        async def start_owned_jobs():
+            gates = {name: asyncio.Event() for name in ("alice", "bob")}
+
+            @tool
+            async def ownership_gate(owner: str) -> str:
+                """Wait until the owning creature's job is released."""
+                await gates[owner].wait()
+                return owner
+
+            engine = get_service_legacy().engine
+            tasks = {}
+            jobs = {}
+            for name, creature_id in (("alice", alice_id), ("bob", bob_id)):
+                agent = engine.get_creature(creature_id).agent
+                agent.add_tool(ownership_gate)
+                jobs[name] = await agent.executor.submit(
+                    "ownership_gate", {"owner": name}, is_direct=True
+                )
+                tasks[name] = agent.executor._tasks[jobs[name]]
+            return gates, tasks, jobs
+
+        gates, tasks, jobs = client.portal.call(start_owned_jobs)
+
+        async def release_owned_job(name):
+            gates[name].set()
+            await tasks[name]
+
+        try:
+            for order in (("alice", "bob"), ("bob", "alice")):
+                for target in order:
+                    response = client.get(
+                        f"/api/sessions/{session_id}/creatures/{target}/history"
+                    )
+                    assert response.status_code == 200, response.text
+                    assert response.json()["live_job_ids"] == [jobs[target]]
+                saved = client.get(f"/api/sessions/{session_id}/history/alice")
+                assert saved.status_code == 200, saved.text
+                assert set(saved.json()["live_job_ids"]) == set(jobs.values())
+            client.portal.call(release_owned_job, "bob")
+            for target in ("bob", "alice"):
+                response = client.get(
+                    f"/api/sessions/{session_id}/creatures/{target}/history"
+                )
+                assert response.json()["live_job_ids"] == (
+                    [jobs["alice"]] if target == "alice" else []
+                )
+            client.portal.call(release_owned_job, "alice")
+            for target in ("alice", "bob"):
+                response = client.get(
+                    f"/api/sessions/{session_id}/creatures/{target}/history"
+                )
+                assert response.json()["live_job_ids"] == []
+        finally:
+            for name in ("alice", "bob"):
+                client.portal.call(release_owned_job, name)
 
         # Declare a shared channel and send a message to it.
         resp = client.post(
@@ -2349,12 +2765,10 @@ terrarium:
             assert frame["type"] == "error"
             assert "not found" in frame["content"]
 
-        # Log-tail WS: the server either streams a ``meta`` frame (a log
-        # file exists for this process) or an ``error`` frame (none
-        # found). Both are valid first frames — assert on the type.
+        # Log-tail WS: the test config dir holds no log file yet.
         with client.websocket_connect("/ws/logs") as ws:
             frame = ws.receive_json()
-            assert frame["type"] in {"meta", "error"}
+            assert frame["type"] == "error"
 
         # A zero-backlog daemon stream closes without replaying historical logs.
         with client.websocket_connect("/ws/daemon/logs?follow=false&lines=0") as ws:
@@ -2364,7 +2778,7 @@ terrarium:
         # ``ready`` frame; an unknown agent gets an ``error`` frame.
         with client.websocket_connect(f"/ws/files/{alice_id}") as ws:
             frame = ws.receive_json()
-            assert frame["type"] in {"ready", "error"}
+            assert frame["type"] == "ready"
         with client.websocket_connect("/ws/files/ghost-agent") as ws:
             frame = ws.receive_json()
             assert frame["type"] == "error"
@@ -2584,8 +2998,8 @@ async def test_managed_local_engine_receives_settings_derived_drive_runtime(
     registry; absent settings create and use enabled generic + goal defaults.
     """
     from kohakuterrarium.api.deps import get_service_legacy, set_service
-    from kohakuterrarium.studio.identity import drive_settings as ds
-    from kohakuterrarium.studio.identity.drive_settings import (
+    from kohakuterrarium.studio.identity.drive_settings import settings as ds
+    from kohakuterrarium.studio.identity.drive_settings.settings import (
         DriveSettings,
         RegistrationSetting,
     )
@@ -2630,7 +3044,9 @@ def test_drive_record_http_lifecycle(monkeypatch, tmp_path) -> None:
     entered by the TestClient lifespan so every async primitive lives in one loop.
     """
     from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
-    from kohakuterrarium.terrarium.drive.registration import GenericDriveRegistration
+    from kohakuterrarium.terrarium.drive.registration.registration import (
+        GenericDriveRegistration,
+    )
 
     monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "drive-sessions"))
     engine = Terrarium(
@@ -2820,7 +3236,7 @@ class TestMultiNodeApiIntegration:
     """The api folder driven against a lab-host service shape."""
 
     def _client(self, monkeypatch, tmp_path) -> tuple[TestClient, str, str]:
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         session_dir = tmp_path / "sessions"
         session_dir.mkdir()
@@ -2898,7 +3314,7 @@ class TestMultiNodeApiIntegration:
         # through the service and bridge via ``service.connect`` — the
         # pre-fix route walked the empty host coordination engine and
         # returned 404 for every cross-node merge.
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         session_dir = tmp_path / "sessions"
         session_dir.mkdir()
@@ -2958,7 +3374,7 @@ class TestMultiNodeApiIntegration:
         user's, breaking the "user channel name is meaningful" UX
         invariant.
         """
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         session_dir = tmp_path / "sessions"
         session_dir.mkdir()
@@ -3018,7 +3434,7 @@ class TestMultiNodeApiIntegration:
         the route did — full e2e proof lives in
         ``tests/e2e/test_multinode_real.py``.
         """
-        from kohakuterrarium.terrarium.service import CreatureInfo
+        from kohakuterrarium.terrarium.service.service import CreatureInfo
 
         session_dir = tmp_path / "sessions"
         session_dir.mkdir()

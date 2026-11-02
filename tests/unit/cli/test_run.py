@@ -61,15 +61,15 @@ class TestCliTopology:
         )()
 
         monkeypatch.setattr(
-            "kohakuterrarium.terrarium.channels.inject_channel_trigger",
+            "kohakuterrarium.terrarium.channels.channels.inject_channel_trigger",
             lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(
-            "kohakuterrarium.terrarium.topology.set_listen",
+            "kohakuterrarium.terrarium.graph.topology.set_listen",
             lambda *_args, **_kwargs: None,
         )
         monkeypatch.setattr(
-            "kohakuterrarium.terrarium.topology.set_send",
+            "kohakuterrarium.terrarium.graph.topology.set_send",
             lambda *_args, **_kwargs: None,
         )
 
@@ -106,8 +106,10 @@ class TestRunStartupTrace:
         async def _run_cli(_engine, creature_id, _store):
             assert creature_id == "focus"
 
-        from kohakuterrarium.studio.identity import drive_settings
-        from kohakuterrarium.terrarium import engine as engine_module
+        from kohakuterrarium.studio.identity.drive_settings import (
+            settings as drive_settings,
+        )
+        from kohakuterrarium.terrarium.engine import engine as engine_module
 
         monkeypatch.setattr(drive_settings, "resolve_drive_kwargs", lambda: {})
         monkeypatch.setattr(
@@ -124,7 +126,7 @@ class TestRunStartupTrace:
         monkeypatch.setattr(
             run, "_apply_cli_topology", lambda *_args, **_kwargs: _async_none()
         )
-        from kohakuterrarium.terrarium import engine_rich_cli
+        from kohakuterrarium.terrarium.engine.cli import rich as engine_rich_cli
 
         monkeypatch.setattr(engine_rich_cli, "run_engine_with_rich_cli", _run_cli)
         monkeypatch.setattr(
@@ -171,12 +173,10 @@ class TestSessionDir:
         assert run._session_dir() == explicit
 
     def test_config_dir_supplies_default_root(self, monkeypatch, tmp_path):
+        # HOME is redirected after import (conftest), so the import-time default
+        # no longer equals a HOME read now; it must still count as unreplaced.
         monkeypatch.delenv("KT_SESSION_DIR", raising=False)
-        monkeypatch.setattr(
-            run,
-            "_SESSION_DIR",
-            run.Path.home() / ".kohakuterrarium" / "sessions",
-        )
         monkeypatch.setattr(run, "config_dir", lambda: tmp_path / "config")
+        assert run.Path.home() / ".kohakuterrarium" / "sessions" != run._SESSION_DIR
 
         assert run._session_dir() == tmp_path / "config" / "sessions"

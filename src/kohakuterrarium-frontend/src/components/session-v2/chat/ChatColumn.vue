@@ -1,5 +1,6 @@
 <template>
   <div class="kt-v2-chatcol h-full min-h-0 flex flex-col relative" :class="{ 'ring-2 ring-inset ring-iolite/30': dragOver }" :style="reserveRight ? { paddingRight: '23.5rem' } : null" @dragenter="onDragEnter" @dragleave="onDragLeave" @dragover="onDragOver" @drop="onDrop">
+    <SideConversationHost :side="composer.sideConversation" />
     <ConversationStrip v-if="strip" :narrow="narrow" />
     <div v-if="empty" class="flex-1 min-h-0 flex flex-col items-center justify-end pb-6 px-4">
       <ChatEmptyHero :tab-key="tabKey" />
@@ -24,7 +25,9 @@
 <script setup>
 import { computed, h, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue"
 
+import SideConversationHost from "@/components/subagents/SideConversationHost.vue"
 import ChatMessage from "@/components/chat/ChatMessage.vue"
+import { toolArgsProgressLabel } from "@/components/chat/toolArgsProgress"
 import ChatComposerBar from "@/components/session-v2/chat/ChatComposerBar.vue"
 import ChatEmptyHero from "@/components/session-v2/chat/ChatEmptyHero.vue"
 import ConversationStrip from "@/components/session-v2/chat/ConversationStrip.vue"
@@ -84,6 +87,7 @@ async function reloadHistory() {
 
 const runningJobs = computed(() => chat.runningJobCountForTab(tabKey.value))
 const recovery = computed(() => chat.modelRecoveryForTab?.(tabKey.value))
+const toolArgs = computed(() => chat.toolArgsProgressForTab?.(tabKey.value) || null)
 const streaming = computed(() => chat.processing && chat.viewingRunningBranch)
 const showProcessing = computed(() => !!recovery.value || runningJobs.value > 0 || streaming.value)
 const processingLabel = computed(() => {
@@ -92,6 +96,8 @@ const processingLabel = computed(() => {
     const key = recovery.value === "waiting" ? "chat.processingRetry" : "chat.processingRecovery"
     return it(n ? `${key}Bg` : key, { n })
   }
+  const writing = toolArgsProgressLabel(toolArgs.value, it)
+  if (writing) return writing
   if (streaming.value && n) return it("chat.processingStreamingBg", { n })
   if (streaming.value) return it("chat.processingStreaming")
   if (n) return it("chat.processingWaitingBg", { n })

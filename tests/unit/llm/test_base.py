@@ -12,14 +12,20 @@ from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
     LLMConfig,
+    LLMProvider,
     NativeToolCall,
     OverflowRecoveryState,
     ToolSchema,
     fork_llm,
 )
 from kohakuterrarium.llm.message import Message
-from kohakuterrarium.llm.recovery import ErrorClass
-from kohakuterrarium.llm.request_budget import MAX_REQUEST_SHRINKS, RequestMeasure
+from kohakuterrarium.llm.recovery.errors import ErrorClass
+from kohakuterrarium.llm.recovery.request_budget import (
+    MAX_REQUEST_SHRINKS,
+    RequestMeasure,
+)
+
+pytestmark = pytest.mark.real_llm_provider
 
 
 class TestToolSchema:
@@ -85,14 +91,14 @@ class _StubProvider(BaseLLMProvider):
         )
 
 
-class TestBaseLLMProviderLifecycle:
-    async def test_close_without_persistent_resources_is_repeatable(self):
-        provider = _StubProvider()
-        await provider.fork().close()
-        await provider.close()
-        await provider.close()
-        response = await provider.chat_complete([{"role": "user", "content": "hi"}])
-        assert response.content == "full-response"
+class TestProviderLifecycle:
+    async def test_default_close_is_inherited_and_repeatable(self):
+        provider = _StubProvider(LLMConfig(model="m"))
+        assert callable(LLMProvider.close)
+        assert isinstance(provider, LLMProvider)
+        assert await provider.close() is None
+        assert await provider.close() is None
+        assert provider.config.model == "m"
 
 
 class TestBaseLLMProviderNormalisation:

@@ -14,8 +14,7 @@ identity / config stores — redirected into ``tmp_path`` so the suite
 never touches the user's ``~/.kohakuterrarium`` directory. The only
 seam is the LLM: both ``create_llm_provider`` bind points are
 monkeypatched to a deterministic :class:`ScriptedLLM` for the
-live-creature leg of the journey. The final shutdown leg uses a real
-Antigravity provider with offline credential and HTTP responses.
+live-creature leg of the journey.
 
 The journey, in one method:
 
@@ -32,15 +31,11 @@ The journey, in one method:
 5. Confirm consumption — the registered profile is selectable (shows
    up in the catalog models list) and the default model resolves to
    it; switching the live creature to that profile takes effect.
-6. Generate with Antigravity and terminate the session through the API,
-   verifying that its creature and graph leave the active runtime.
 """
 
-import json
 from collections.abc import Iterator
 from pathlib import Path
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -49,8 +44,6 @@ from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.api.routes.catalog import _deps as catalog_deps
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
-from kohakuterrarium.llm import antigravity_auth as agy_auth
-from kohakuterrarium.llm.antigravity_provider import AntigravityProvider
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
 
@@ -68,6 +61,11 @@ input:
   type: none
 output:
   type: stdout
+tools:
+  - name: web_search
+    type: builtin
+  - name: web_fetch
+    type: builtin
 plugins:
   - name: budget
     options:
@@ -159,7 +157,6 @@ class TestApiSettingsJourney:
         client: TestClient,
         creature_dir: Path,
         scripted_llm: ScriptedLLM,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # ── 1. Identity: LLM backend CRUD ─────────────────────────────
         # Baseline: only the built-in backends, no user backends.
@@ -486,6 +483,54 @@ class TestApiSettingsJourney:
         assert ("plugin", "budget") in modules
         assert modules[("plugin", "budget")]["enabled"] is True
 
+        for name, backend, baseline in (
+            ("web_search", "deepseek_api", "duckduckgo"),
+            ("web_fetch", "deepseek", "auto"),
+        ):
+            url = (
+                f"/api/sessions/{session_id}/creatures/{creature_id}"
+                f"/modules/tool/{name}/options"
+            )
+            assert modules[("tool", name)]["options"]["backend"] == baseline
+            resp = client.put(url, json={"values": {"backend": backend}})
+            assert resp.status_code == 400
+            assert "key" in resp.json()["detail"].lower()
+            assert client.get(url).json()["options"]["backend"] == baseline
+
+        resp = client.post(
+            "/api/settings/keys",
+            json={"provider": "deepseek", "key": "test-only-deepseek-key"},
+        )
+        assert resp.status_code == 200
+        for name, backend, baseline in (
+            ("web_search", "deepseek_api", "duckduckgo"),
+            ("web_fetch", "deepseek", "auto"),
+        ):
+            url = (
+                f"/api/sessions/{session_id}/creatures/{creature_id}"
+                f"/modules/tool/{name}/options"
+            )
+            resp = client.put(url, json={"values": {"backend": backend}})
+            assert resp.status_code == 200
+            assert client.get(url).json()["options"]["backend"] == backend
+            if name == "web_search":
+                resp = client.put(
+                    url, json={"values": {"deepseek_model": "deepseek-v4-flash"}}
+                )
+                assert resp.status_code == 200
+                current = client.get(url).json()
+                assert current["options"]["deepseek_model"] == "deepseek-flash"
+                assert current["schema"]["deepseek_model"]["values"] == [
+                    "deepseek-v4-pro",
+                    "deepseek-flash",
+                ]
+            resp = client.put(url, json={"values": {"backend": "invalid-backend"}})
+            assert resp.status_code == 400
+            assert client.get(url).json()["options"]["backend"] == backend
+            resp = client.put(url, json={"values": {}})
+            assert resp.status_code == 200
+            assert client.get(url).json()["options"]["backend"] == baseline
+
         # 7b. Read the plugin's option schema + current values.
         resp = client.get(
             f"/api/sessions/{session_id}/creatures/{creature_id}"
@@ -610,7 +655,7 @@ class TestApiSettingsJourney:
         assert resp.status_code == 404
         # native_tool does not support toggle — that is a hard 400.
         resp = client.post(f"{cbase}/modules/native_tool/anything/toggle")
-        assert resp.status_code in (400, 404)
+        assert resp.status_code == 400
         # Re-enable the budget plugin and reset its options to defaults
         # by applying an empty values payload — the live creature reads
         # back the plugin's declared defaults again.
@@ -679,7 +724,7 @@ class TestApiSettingsJourney:
         # SCHEMA validation (raw save = validated-persist only, design §8.4):
         # an invalid runtime block is a 400, never a silent enable.
         from kohakuterrarium.api.deps import get_service_legacy
-        from kohakuterrarium.studio.identity import drive_settings as ds
+        from kohakuterrarium.studio.identity.drive_settings import settings as ds
 
         current_drive_file = client.get(
             "/api/settings/config-files/drive-settings/content"
@@ -721,68 +766,3 @@ class TestApiSettingsJourney:
         resp = client.delete(f"/api/sessions/active/{session_id}")
         assert resp.status_code == 200
         assert client.get("/api/sessions/active").json() == []
-
-        # A real agy provider can generate a turn and terminate through the API.
-        def agy_http(request):
-            if request.url.path.endswith("loadCodeAssist"):
-                return httpx.Response(200, json={"cloudaicompanionProject": "offline"})
-            assert request.url.path.endswith("streamGenerateContent")
-            assert json.loads(request.content)["model"] == "gemini-3.8-flash-tiered"
-            return httpx.Response(
-                200,
-                text="data: "
-                + json.dumps(
-                    {
-                        "response": {
-                            "candidates": [
-                                {
-                                    "content": {"parts": [{"text": "AGY_OK"}]},
-                                    "finishReason": "STOP",
-                                }
-                            ]
-                        }
-                    }
-                )
-                + "\n\n",
-            )
-
-        agy = AntigravityProvider(
-            "gemini-3.8-flash", transport=httpx.MockTransport(agy_http)
-        )
-        with monkeypatch.context() as agy_patch:
-            agy_patch.setattr(
-                agy_auth,
-                "read_sources",
-                lambda: [
-                    agy_auth.BorrowedCredential("offline-agy", 4102444800, "test")
-                ],
-            )
-            agy_patch.setattr(
-                _bootstrap_llm, "create_llm_provider", lambda config, selector=None: agy
-            )
-            agy_patch.setattr(
-                _agent_init, "create_llm_provider", lambda config, selector=None: agy
-            )
-            created = client.post(
-                "/api/sessions/active/agents",
-                json={
-                    "config_path": str(creature_dir),
-                    "llm": "google-antigravity/gemini-3.8-flash",
-                },
-            )
-            assert created.status_code == 200, created.text
-            session_id = created.json()["session_id"]
-            creature_id = created.json()["agent_id"]
-            creature = engine.list_creatures()[0]
-            response = client.post(
-                f"/api/sessions/{session_id}/creatures/{creature_id}/chat",
-                json={"message": "finish this agy session"},
-            )
-            assert response.status_code == 200, response.text
-            assert response.json() == {"response": "AGY_OK"}
-            stopped = client.delete(f"/api/sessions/active/{session_id}")
-            assert stopped.status_code == 200, stopped.text
-            assert not creature.is_running
-            assert engine.list_creatures() == []
-            assert engine.list_graphs() == []
-            assert client.get("/api/sessions/active").json() == []

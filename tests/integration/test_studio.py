@@ -36,35 +36,43 @@ side effect.
 import asyncio
 import io
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 import numpy as np
 import pytest
+from kohakuvault import KVault
 
+import kohakuterrarium.session.vault.io as vault_io
 from kohakuterrarium.errors import (
     InvalidRequestError,
     NotFoundError,
+    SessionError,
     SessionNotFoundError,
 )
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.packages.locations import ensure_local_project
-from kohakuterrarium.studio.catalog.packages_scan import scan_creatures_in_dirs
-from kohakuterrarium.session.embedding import BaseEmbedder
+from kohakuterrarium.studio.catalog.packages.scan import scan_creatures_in_dirs
+from kohakuterrarium.session.memory.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.identity import grok_subscription
+from kohakuterrarium.session.occupancy.gate import GATE, try_fast
+from kohakuterrarium.studio.identity.grok import subscription as grok_subscription
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
 from kohakuterrarium.studio.persistence.session_index import close_session_index
-from kohakuterrarium.studio.sessions import memory_search as _session_memory_mod
+from kohakuterrarium.studio.sessions.memory import search as _session_memory_mod
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM, ScriptEntry
+from kohakuterrarium.testing.llm_seam import real_llm_providers
+from kohakuterrarium.utils.file.lock import FileLock
 from kohakuterrarium.session import job_reaper, run_state
 from kohakuterrarium.studio.sessions.live import live_sessions
 from kohakuterrarium.studio.sessions.live.restore import restore_live_sessions
 from kohakuterrarium.studio.sessions.live.run_classes import CONTINUE_NUDGE
 
 from tests.helpers.antigravity_usage import install_quota_script, assert_quota
+from tests.helpers.kt_biome import find_kt_biome_source
 from kohakuterrarium.studio.identity import antigravity
 
 from tests.helpers.grok_usage_script import (
@@ -80,7 +88,7 @@ from tests.helpers.grok_usage_script import (
     write_metadata_version,
 )
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------
@@ -172,29 +180,6 @@ async def _drain_chat(
     return "".join(chunks)
 
 
-def _find_kt_biome_source() -> Path | None:
-    """Locate a kt-biome bundle to install into the isolated catalog.
-
-    Dev machines carry a repo-local ``kt-biome/`` checkout; CI installs
-    kt-biome editable into the operator config dir before the suite
-    runs (see ``.github/workflows/ci.yml``), which leaves a
-    ``kt-biome.link`` pointing at the cloned source.
-    """
-    repo_local = Path(__file__).resolve().parents[2] / "kt-biome"
-    if (repo_local / "kohaku.yaml").exists():
-        return repo_local
-    real_pkgs = Path.home() / ".kohakuterrarium" / "packages"
-    link = real_pkgs / "kt-biome.link"
-    if link.exists():
-        target = Path(link.read_text(encoding="utf-8").strip())
-        if (target / "kohaku.yaml").exists():
-            return target
-    direct = real_pkgs / "kt-biome"
-    if (direct / "kohaku.yaml").exists():
-        return direct
-    return None
-
-
 def _scaffold_creature(studio: Studio, workspace_root: Path, name: str) -> Path:
     """Scaffold a workspace creature and give it a deterministic prompt.
 
@@ -243,7 +228,7 @@ class TestStudioIntegration:
         workspace_root.mkdir()
         session_dir = isolated_paths["session_dir"]
 
-        from kohakuterrarium.studio.editors.workspace_fs import LocalWorkspace
+        from kohakuterrarium.studio.editors.workspace.fs import LocalWorkspace
 
         async with Studio() as studio:
             # --- editors: scaffold + edit a workspace creature ----------
@@ -559,7 +544,25 @@ class TestStudioIntegration:
                 assert [n["id"] for n in tree["nodes"]] == [tree["session_id"]]
                 assert tree["edges"] == []
 
-                summary = studio.persistence.viewer.summary(store, saved_stem, None)
+                read_names = []
+                original_get_events = store.get_events
+
+                def read_events(name, *args, **kwargs):
+                    read_names.append(name)
+                    return original_get_events(name, *args, **kwargs)
+
+                with monkeypatch.context() as counters:
+                    counters.setattr(store, "get_events", read_events)
+                    summary = studio.persistence.viewer.summary(store, saved_stem, None)
+                    assert read_names == ["scout"]
+                    read_names.clear()
+                    scoped_summary = studio.persistence.viewer.summary(
+                        store, saved_stem, "scout"
+                    )
+                    assert read_names == ["scout"]
+                assert scoped_summary["totals"] == summary["totals"]
+                assert scoped_summary["error_turns"] == summary["error_turns"]
+                assert scoped_summary["compact_turns"] == summary["compact_turns"]
                 assert summary["agents"] == ["scout"]
                 assert summary["config_type"] == "agent"
                 assert summary["totals"]["turns"] == 2
@@ -614,6 +617,35 @@ class TestStudioIntegration:
                 event_types = {e["type"] for e in events["events"]}
                 assert "user_input" in event_types
                 assert "text_chunk" in event_types
+                event_reads = []
+                original_read = KVault.get_many
+
+                def read_event_values(table, keys, *args, **kwargs):
+                    if table is store.events:
+                        event_reads.extend(keys)
+                    return original_read(table, keys, *args, **kwargs)
+
+                with monkeypatch.context() as counters:
+                    counters.setattr(vault_io, "READ_CHUNK", 1)
+                    counters.setattr(KVault, "get_many", read_event_values)
+                    cursor = None
+                    for index in range(2):
+                        event_reads.clear()
+                        page = studio.persistence.viewer.events(
+                            store,
+                            saved_stem,
+                            agent="scout",
+                            turn_index=None,
+                            types=None,
+                            from_ts=None,
+                            to_ts=None,
+                            limit=1,
+                            cursor=cursor,
+                        )
+                        assert page["events"] == events["events"][index : index + 1]
+                        cursor = events["events"][index]["event_id"]
+                        assert page["next_cursor"] == cursor
+                        assert len(event_reads) == index + 1
                 # Filtering events by type narrows the result set to
                 # exactly the requested kind.
                 only_inputs = studio.persistence.viewer.events(
@@ -733,6 +765,7 @@ class TestStudioIntegration:
             index = studio.persistence.history_index(saved_path)
             assert index["session_name"] == saved_stem
             assert "scout" in index["targets"]
+            assert index["viewer_agents"] == ["scout"]
             scout_history = studio.persistence.history(saved_path, "scout")
             assert scout_history["session_name"] == saved_stem
             assert scout_history["meta"]["agents"] == ["scout"]
@@ -759,6 +792,30 @@ class TestStudioIntegration:
             assert (
                 diff_scoped["a"]["total_messages"] >= diff_scoped["b"]["total_messages"]
             )
+
+            fork_history_before = studio.persistence.history(fork_path, "scout")
+            attached = "scout:attached:review:0"
+            discovery_store = SessionStore(fork_path)
+            try:
+                discovery_store.append_event(
+                    attached, "user_input", {"content": "review the fork"}
+                )
+                discovery_store.set_viewer_default_agent(attached)
+                viewer_summary = studio.persistence.viewer.summary(
+                    discovery_store, fork_path.stem
+                )
+            finally:
+                discovery_store.close(update_status=False)
+            fork_index = studio.persistence.history_index(fork_path)
+            assert fork_index["viewer_agents"] == [attached, "scout"]
+            assert fork_index["targets"] == ["scout"]
+            assert fork_index["meta"]["agents"] == ["scout"]
+            assert viewer_summary["agents"] == fork_index["viewer_agents"]
+            with pytest.raises(NotFoundError):
+                studio.persistence.history(fork_path, attached)
+            fork_history_after = studio.persistence.history(fork_path, "scout")
+            assert fork_history_after["messages"] == fork_history_before["messages"]
+            assert fork_history_after["events"] == fork_history_before["events"]
 
             # --- persistence.list sees both sessions now ----------------
             fork_stem = fork_path.name.split(".kohakutr")[0]
@@ -1174,9 +1231,10 @@ class TestStudioIntegration:
             # --- model switch: needs a key + a profile ------------------
             studio.identity.keys.set("openai", "sk-integration-test-key")
             studio.identity.llm.save_profile("rt-fast", "gpt-4o-mini", "openai")
-            new_model = studio.sessions.model.switch(
-                session_id, creature_id, "openai/rt-fast"
-            )
+            with real_llm_providers():
+                new_model = studio.sessions.model.switch(
+                    session_id, creature_id, "openai/rt-fast"
+                )
             assert new_model == "openai/rt-fast"
             # The live creature status reflects the swap.
             status = studio.sessions.list_creatures(session_id)[0]
@@ -1188,10 +1246,11 @@ class TestStudioIntegration:
             assert any(p["name"] == "sandbox" for p in plugins)
             assert any(p["name"] == "goal" and p["enabled"] for p in plugins)
             assert any(p["name"] == "drive_runtime" and p["enabled"] for p in plugins)
+            # The renderer-gated UI plugins are on by default; policy plugins are off.
+            on_by_default = {"goal", "drive_runtime", "ui.apps", "ui.declarative"}
+            assert {p["name"] for p in plugins if p["enabled"]} == on_by_default
             assert all(
-                p["enabled"] is False
-                for p in plugins
-                if p["name"] not in {"goal", "drive_runtime"}
+                p["enabled"] is False for p in plugins if p["name"] not in on_by_default
             )
             toggled_on = await studio.sessions.plugins.toggle(
                 session_id, creature_id, "sandbox"
@@ -1305,10 +1364,55 @@ class TestStudioIntegration:
                 "        listen: [ops-net]\n",
                 encoding="utf-8",
             )
+            scripted_llm["script"] = [
+                ScriptEntry(
+                    "w1",
+                    usage={
+                        "prompt_tokens": 500,
+                        "completion_tokens": 30,
+                        "total_tokens": 530,
+                    },
+                ),
+                ScriptEntry(
+                    "w2",
+                    usage={
+                        "prompt_tokens": 800,
+                        "completion_tokens": 40,
+                        "total_tokens": 840,
+                    },
+                ),
+            ]
             team = await studio.sessions.start_terrarium(str(recipe))
             assert team.name == "rt-team"
             team_sid = team.session_id
             assert {c["name"] for c in team.creatures} == {"lead", "worker"}
+            # --- per-creature usage: a creature no viewer ever attached to
+            # reports backend running totals and context fill after turns.
+            worker_id = next(
+                c["creature_id"] for c in team.creatures if c["name"] == "worker"
+            )
+            assert await _drain_chat(studio, team_sid, worker_id, "first") == "w1"
+            assert await _drain_chat(studio, team_sid, worker_id, "second") == "w2"
+            by_name = {c["name"]: c for c in studio.sessions.list_creatures(team_sid)}
+            assert by_name["worker"]["token_usage"] == {
+                "prompt": 1300,
+                "completion": 70,
+                "cached": 0,
+                "total": 1370,
+            }
+            assert by_name["worker"]["context_tokens"] == 800
+            assert by_name["lead"]["token_usage"]["total"] == 0
+            # The graph view reads the same backend figures.
+            graph_snap = await studio.service.runtime_graph_snapshot()
+            snap_worker = next(
+                c
+                for g in graph_snap["graphs"]
+                if g["graph_id"] == team_sid
+                for c in g["creatures"]
+                if c["name"] == "worker"
+            )
+            assert snap_worker["token_usage"]["total"] == 1370
+            assert snap_worker["context_tokens"] == 800
             # The graph carries the declared channel + per-creature
             # implicit direct channels.
             assert {c["name"] for c in team.channels} == {
@@ -1565,7 +1669,10 @@ class TestStudioIntegration:
             assert bash_info["name"] == "bash"
             assert bash_info["source"] == "builtin"
             subagent_entries = studio.catalog.builtins.list("subagents")
-            assert {"explore", "plan"} <= {s["name"] for s in subagent_entries}
+            assert {"explore", "critic"} <= {s["name"] for s in subagent_entries}
+            assert not {"worker", "plan", "research", "coordinator"} & {
+                s["name"] for s in subagent_entries
+            }
             # Triggers are a first-class builtin kind too.
             trigger_names = {
                 t["name"] for t in studio.catalog.builtins.list("triggers")
@@ -1598,7 +1705,7 @@ class TestStudioIntegration:
             # and assert the catalog surfaces it.  The source is the
             # repo-local checkout on dev machines, or the operator-level
             # editable install CI provisions before running the suite.
-            biome_src = _find_kt_biome_source()
+            biome_src = find_kt_biome_source()
             if biome_src is None:
                 pytest.skip("kt-biome source not available on this machine")
             assert studio.catalog.packages.list() == []
@@ -1617,7 +1724,7 @@ class TestStudioIntegration:
             assert "general" in {e.name for e in scanned}
 
     async def test_search_memory_releases_file_handle(
-        self, scripted_llm, isolated_paths
+        self, scripted_llm, deterministic_embedder, isolated_paths, monkeypatch
     ):
         """A search over a saved session must not leave the .kohakutr
         locked — deleting it right after the search should succeed.
@@ -1650,6 +1757,20 @@ class TestStudioIntegration:
         saved_stem = saved_path.name.split(".kohakutr")[0]
 
         async with Studio() as studio:
+
+            def fail_encode(self, texts):
+                raise RuntimeError("embedding unavailable during indexing")
+
+            with monkeypatch.context() as fault:
+                fault.setattr(_HashEmbedder, "encode", fail_encode)
+                with pytest.raises(SessionError, match="embedding unavailable"):
+                    await studio.sessions.search_memory(
+                        saved_stem, "index", mode="auto"
+                    )
+            released_path = saved_path.with_suffix(".released")
+            saved_path.rename(released_path)
+            released_path.rename(saved_path)
+
             mem = await studio.sessions.search_memory(
                 saved_stem,
                 "index",
@@ -1658,10 +1779,49 @@ class TestStudioIntegration:
                 agent=None,
             )
             assert mem["count"] >= 1
+            alias = session_dir / "inspection-alias.kohakutr"
+            try:
+                alias.symlink_to(saved_path)
+            except OSError:
+                alias = None
+            if alias is not None:
+                original = saved_path.read_bytes()
+                with ExitStack() as guards:
+                    for suffix in (".lock", ".drives.migrate-lock"):
+                        lock = FileLock(str(saved_path) + suffix)
+                        lock.acquire()
+                        guards.callback(lock.release)
+                    removed_alias = await asyncio.to_thread(
+                        studio.persistence.delete, "inspection-alias"
+                    )
+                assert removed_alias == [alias]
+                assert not alias.is_symlink()
+                assert saved_path.read_bytes() == original
+                assert not GATE.snapshot(saved_path).registered
+                again = await studio.sessions.search_memory(
+                    saved_stem, "index", mode="fts"
+                )
+                assert again["count"] >= 1
             # The search is done — the file must be releasable. With the
             # leak this delete raises PermissionError on Windows.
-            removed = studio.persistence.delete(saved_stem)
+            admission = try_fast(saved_path, eligible=True)
+            assert admission.lease is not None, admission.reason
+            deleting = asyncio.create_task(
+                asyncio.to_thread(studio.persistence.delete, saved_stem)
+            )
+            try:
+                deadline = asyncio.get_running_loop().time() + 5
+                while GATE.snapshot(saved_path).legacy_pending == 0:
+                    assert asyncio.get_running_loop().time() < deadline
+                    await asyncio.sleep(0.01)
+                assert saved_path.exists()
+                assert not deleting.done()
+            finally:
+                admission.lease.finish(source_released=True)
+            removed = await deleting
+            assert saved_path in removed
             assert all(not p.exists() for p in removed)
+            assert not GATE.snapshot(saved_path).registered
 
     async def test_drive_settings_resolver_and_service_lifecycle(
         self, scripted_llm, isolated_paths
@@ -1679,8 +1839,8 @@ class TestStudioIntegration:
         Mirrors the managed CLI/TUI/web path: Studio is the settings owner and
         every Drive op funnels through ``TerrariumService`` (design §8.4, §9.2).
         """
-        from kohakuterrarium.studio.identity import drive_settings as ds
-        from kohakuterrarium.studio.identity.drive_settings import (
+        from kohakuterrarium.studio.identity.drive_settings import settings as ds
+        from kohakuterrarium.studio.identity.drive_settings.settings import (
             DriveSettings,
             RegistrationSetting,
         )

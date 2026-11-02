@@ -23,10 +23,41 @@ pytest tests/ -q
 
 # Coverage for one tier
 pytest tests/unit/ -q --cov=src/kohakuterrarium --cov-report=term-missing
+
+# One focused test: skip the worker spawn
+pytest tests/unit/core/jobs/test_executor.py::TestSerialLock -n 0
 ```
 
 `pytest` is configured in `pyproject.toml` with `asyncio_mode = "auto"`
 (no `@pytest.mark.asyncio` needed) and a per-test timeout.
+
+### Parallel runs
+
+Every run is parallel through pytest-xdist (`addopts = "-n auto --dist
+loadgroup"`). `-n auto` resolves in `tests/conftest.py`:
+`KT_TEST_WORKERS` when set, otherwise `min(16, cpu_count)`, never above
+64. Measured on an 86-core machine: 16 workers 204 s, 32 workers 251 s,
+64 workers 306 s (the suite is I/O- and startup-bound past 16). On a 4-vCPU
+hosted runner the auto value (4) is the measured best: unit 573 s serial →
+199 s, integration 204 s → 118 s; 8–16 workers are no faster.
+
+What keeps tests independent across workers:
+
+- Every test gets a private root (`kt-<uuid>/`): `HOME`, `USERPROFILE`,
+  `XDG_*`, `TMP`/`TEMP`/`TMPDIR` and `tempfile.tempdir` point inside it,
+  and `KT_CONFIG_DIR` points into the test's `tmp_path`. Child processes
+  inherit all of it. The operator's real home is only readable through
+  `tests/helpers/kt_biome.real_home()` (captured before redirection).
+- Tests that share one real resource carry `@pytest.mark.xdist_group(...)`
+  and run in order on one worker: `ports` (probe-a-free-port-then-reuse),
+  `mcp-subprocess` (real `mcp-serve` children), and the whole e2e tier
+  (`e2e`, added automatically). Everything else is distributed per test.
+- "The event loop was not blocked" is witnessed by
+  `tests/helpers/loop_witness.py` (the loop runs a callback while the
+  operation is in flight), never by wall-clock gaps. Ordering and
+  overlap are asserted with counters or events, not elapsed seconds.
+  A new test that bounds elapsed time is a check on the machine, not the
+  design.
 
 **CI policy (`.github/workflows/ci.yml`).** Unit and integration tiers
 run on the full OS × Python matrix (3.12+ on Linux / macOS / Windows).
@@ -79,13 +110,18 @@ protection on `main` come from the unit + integration tiers.
    `kohakuterrarium.testing.llm.ScriptedLLM`. **Prefer direct
    injection**: every construction entry point takes the instance via
    `llm=`, e.g. `Agent.build(cfg, llm=ScriptedLLM([...]))` /
-   `engine.add_creature(path, llm=...)`. The monkeypatch seam at
-   `kohakuterrarium.bootstrap.llm.create_llm_provider` +
-   `kohakuterrarium.bootstrap.agent_init.create_llm_provider` remains
-   for paths where the framework constructs agents internally (config
-   files, resume, recipes) and
-   `kohakuterrarium.core.agent_model.create_llm_from_profile_name` if
-   the test exercises a model switch), the filesystem (`tmp_path`), the
+   `engine.add_creature(path, llm=...)`. Where the framework builds a
+   provider itself (config files, resume, recipes, model switch,
+   compaction, summaries), the autouse seam from
+   `kohakuterrarium.testing.llm_seam` already routes every factory in
+   `LLM_FACTORY_TARGETS` to `ScriptedLLM`; a test that needs its own
+   doubles calls `install_llm_seam(monkeypatch, factory)`. Under the seam
+   constructing a real provider raises `RealProviderBlocked`: a test
+   that drives a provider class against a fake transport marks itself
+   `@pytest.mark.real_llm_provider`, or wraps just that construction in
+   `with real_llm_providers():`. Non-loopback sockets are blocked
+   (`@pytest.mark.allow_network` lifts it) and HOME, CODEX_HOME and
+   KT_CONFIG_DIR point at tmp), the filesystem (`tmp_path`), the
    network. **Never invent a method on a fake that the real class does
    not have**; that bakes a bug in as the expected behavior. Use the
    real engine, real `SessionStore`, real `InProcTransport`, real
@@ -104,7 +140,7 @@ protection on `main` come from the unit + integration tiers.
    exactly as `cli/serve.py` does, not a hand-wired host/client rig.)
 
 4. **No global state leaks.** Tests that mutate a module-global registry
-   (`api.deps._service`, `llm.api_keys._resolver`, …) must snapshot +
+   (`api.deps._service`, `llm.profiles.api_keys._resolver`, …) must snapshot +
    restore; the `isolate_global_state` autouse fixture in
    `tests/conftest.py` handles the known ones. (Studio session
    bookkeeping is no longer module-global: it lives per-engine/service
@@ -133,18 +169,18 @@ Each mirrors how the **real consumer** drives that folder.
 
 | File | Folder | The workflow it runs | Real consumer it mirrors |
 |---|---|---|---|
-| `test_core.py` | `core/` | build an `Agent` → inject input → controller loop → direct + background tool dispatch → sub-agent dispatch → output routing → compaction → termination → interrupt → history ops | `terrarium/creature_host.py`, `bootstrap/agent_init.py` |
+| `test_core.py` | `core/` | build an `Agent` → inject input → controller loop → direct + background tool dispatch → sub-agent dispatch → output routing → compaction → termination → interrupt → history ops | `terrarium/creature/host.py`, `bootstrap/agent_init.py` |
 | `test_bootstrap.py` | `bootstrap/` | `Agent.from_path` on a real on-disk config → every factory fires → run a turn proving the wiring is live | `terrarium/factory.py`, `core/agent.py.__init__` |
-| `test_session.py` | `session/` | init store → creature writes events → record turns → read back → close → resume → verify → memory search → fork → migration | `terrarium/persistence.py`, `studio/sessions/lifecycle.py`, `session/resume.py` |
+| `test_session.py` | `session/` | init store → creature writes events → record turns → read back → close → resume → verify → memory search → fork → migration | `terrarium/persistence.py`, `studio/sessions/lifecycle.py`, `session/resume/resume.py` |
 | `test_terrarium.py` | `terrarium/` | build graph → add creatures → wire channels → broadcast → privileged node mutates → auto-merge/split → session lineage → hot-plug → recipe apply: driven through `LocalTerrariumService` | `studio/sessions/lifecycle.py` |
 | `test_laboratory.py` | `laboratory/` | real host+client over `InProcTransport`, wired as `cli/serve.py` does → `MultiNodeTerrariumService` → spawn-on-worker → remote chat → remote ops → deploy → session sync | `cli/serve.py` boot dispatch, `api/deps.py` |
 | `test_studio.py` | `studio/` | `Studio` façade → catalog → editors create workspace creature → sessions start+chat → persistence save/resume/fork → identity → attach | `api/routes/*`, `cli/*` |
 | `test_api.py` | `api/` | `create_app()` + `TestClient` → create session → WS chat → settings → history → hot-plug → save/resume → delete | frontend `utils/api.js` call sequence |
 | `test_modules.py` | `modules/` | load real plugin/tool/trigger/subagent/output/user_command modules into a real `Agent` → exercise each protocol through a real turn | `bootstrap/*` loads, `core/agent_*` invokes |
 | `test_prompt.py` | `prompt/` | assemble a real agent's system prompt through the aggregator → on-demand `##info##` skill load → template rendering | `core/agent_init`, `bootstrap` |
-| `test_parsing.py` | `parsing/` | feed real streamed LLM output through `StreamParser` across chunk boundaries → exact tool-call/command/text events | `core/controller.py` |
+| `test_parsing.py` | `parsing/` | feed real streamed LLM output through `StreamParser` across chunk boundaries → exact tool-call/command/text events | `core/controller/controller.py` |
 | `test_commands.py` | `commands/` | a real controller turn emits `##info##` / `##read##` → command resolves docs/skills into the conversation | `core/controller`, `core/agent_handlers` |
-| `test_mcp.py` | `mcp/` | real in-process stdio MCP server → connect → list → call → disconnect, cross-task as `core/agent_mcp.py` drives it | `core/agent_mcp.py` |
+| `test_mcp.py` | `mcp/` | real in-process stdio MCP server → connect → list → call → disconnect, cross-task as `core/agent/mcp.py` drives it | `core/agent/mcp.py` |
 | `test_compose.py` | `compose/` | build real `>>` / `&` / `\|` / `*` pipelines over engine-backed runnables and run them | user code (compose is a public API) |
 | `test_serving.py` | `serving/` | `KohakuManager` + `AgentSession` → create session → stream chat → lifecycle | `api/`, `compose/` |
 | `test_packages.py` | `packages/` | install a local package → list → info → resolve a `pkg:` ref → uninstall | `cli/packages.py`, `terrarium/config.py` |
@@ -204,12 +240,12 @@ testing otherwise.
 |---|---|
 | `cli/` | argparse + interactive prompts; covered by e2e for the resumable paths |
 | `builtins/cli_rich/`, `builtins/tui/` | Rich / Textual terminal UI; visual |
-| `llm/openai.py`, `llm/codex_*.py`, `llm/litellm_provider.py` | Need a live provider |
-| `terrarium/engine_cli.py`, `terrarium/engine_rich_cli.py`, `terrarium/cli_output.py` | CLI / TTY UI |
-| `studio/attach/pty_posix.py`, `studio/attach/pty_windows.py`, `studio/attach/pty_router.py` | Platform-specific PTY backends, gated at import |
-| `studio/identity/codex_oauth.py` | 3rd-party OAuth flow |
-| `session/embedding.py` (non-deterministic embedders) | 3rd-party model dependency |
-| `laboratory/_internal/transport_ws.py` | `websockets` library: `InProcTransport` is the test transport |
+| `llm/openai/provider.py`, `llm/codex/`, `llm/litellm_provider.py` | Need a live provider |
+| `terrarium/engine/cli/tui.py`, `terrarium/engine/cli/rich.py`, `terrarium/engine/cli/output.py` | CLI / TTY UI |
+| `studio/attach/pty/posix.py`, `studio/attach/pty/windows.py`, `studio/attach/pty/router.py` | Platform-specific PTY backends, gated at import |
+| `studio/identity/codex/oauth.py` | 3rd-party OAuth flow |
+| `session/memory/embedding.py` (non-deterministic embedders) | 3rd-party model dependency |
+| `laboratory/_internal/transport/ws.py` | `websockets` library: `InProcTransport` is the test transport |
 | `builtins/inputs/cli*.py`, `builtins/inputs/tui*.py`, `builtins/outputs/*` (terminal/audio) | CLI / TUI / audio UI |
 | `serving/web.py` (the pywebview / uvicorn boot path) | Desktop bundling, manual test only |
 | `api/main.py`, `__briefcase__.py` | Server / bundler entry points: module-level side effects only |

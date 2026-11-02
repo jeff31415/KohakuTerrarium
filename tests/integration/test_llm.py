@@ -28,12 +28,14 @@ Why these collaborators are real:
     reset so resolution is deterministic with no installed packages.
 """
 
-import base64
 import asyncio
-from collections import deque
+import base64
 import io
 import json
 import random
+from collections import deque
+from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -43,23 +45,27 @@ from PIL import Image
 from websockets import serve
 
 from kohakuterrarium import Terrarium
-from kohakuterrarium.core.agent_budget_recovery import apply_context_repair
-from kohakuterrarium.core.conversation import Conversation
-from kohakuterrarium.llm import antigravity_auth as agy_auth
-from kohakuterrarium.session.history import (
+from kohakuterrarium.errors import MediaReferenceError
+from kohakuterrarium.core.agent.turn.budget_recovery import apply_context_repair
+from kohakuterrarium.core.config.types import AgentConfig, ToolConfigItem
+from kohakuterrarium.core.controller.controller import Controller, ControllerConfig
+from kohakuterrarium.core.conversation.conversation import Conversation
+from kohakuterrarium.core.events import create_user_input_event
+from kohakuterrarium.llm.antigravity import auth as agy_auth
+from kohakuterrarium.session.history.replay import (
     replay_conversation,
     normalize_resumable_events,
 )
 from kohakuterrarium.bootstrap.llm import _create_from_profile
-from kohakuterrarium.builtins.tools.grok_image_gen import GrokImageGenTool
-from kohakuterrarium.builtins.tools.read import ReadTool
+from kohakuterrarium.builtins.tools.media.grok_image_gen import GrokImageGenTool
+from kohakuterrarium.builtins.tools.files.read import ReadTool
 from kohakuterrarium.core.registry import Registry
-from kohakuterrarium.core.tool_output import normalize_tool_result
-from kohakuterrarium.llm import api_keys as ak
-from kohakuterrarium.llm import artifact_resolve
-from kohakuterrarium.llm import backends as backends_mod
-from kohakuterrarium.llm import presets as presets_mod
-from kohakuterrarium.llm.backends import (
+from kohakuterrarium.core.tools.output import normalize_tool_result
+from kohakuterrarium.llm.profiles import api_keys as ak
+from kohakuterrarium.llm.media import artifacts as artifact_resolve
+from kohakuterrarium.llm.profiles import backends as backends_mod
+from kohakuterrarium.llm.presets import catalog as presets_mod
+from kohakuterrarium.llm.profiles.backends import (
     _normalize_backend_type,
     legacy_provider_from_data,
     validate_backend_type,
@@ -71,11 +77,11 @@ from kohakuterrarium.llm.base import (
     NativeToolCall,
     ToolSchema,
 )
-from kohakuterrarium.llm.codex_auth import CodexTokens
-from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
-from kohakuterrarium.llm.grok_auth import GROK_CLI_BASE_URL, GrokToken, GrokTokens
-from kohakuterrarium.llm.grok_image_gen import GrokImageClient
-from kohakuterrarium.llm.grok_media import GrokMediaClient
+from kohakuterrarium.llm.codex.auth import CodexTokens
+from kohakuterrarium.llm.codex.provider import CodexOAuthProvider
+from kohakuterrarium.llm.grok.auth import GROK_CLI_BASE_URL, GrokToken, GrokTokens
+from kohakuterrarium.llm.grok.image_gen import GrokImageClient
+from kohakuterrarium.llm.grok.media import GrokMediaClient
 from kohakuterrarium.llm.message import (
     AssistantMessage,
     FilePart,
@@ -90,11 +96,11 @@ from kohakuterrarium.llm.message import (
     make_multimodal_content,
     messages_to_dicts,
 )
-from kohakuterrarium.llm.openai import OpenAIProvider
+from kohakuterrarium.llm.openai.provider import OpenAIProvider
 from kohakuterrarium.studio.attach._event_stream import StreamOutput
-from kohakuterrarium.llm.presets import iter_all_presets, resolve_alias
-from kohakuterrarium.llm.profile_types import LLMBackend, LLMPreset, LLMProfile
-from kohakuterrarium.llm.profiles import (
+from kohakuterrarium.llm.presets.catalog import iter_all_presets, resolve_alias
+from kohakuterrarium.llm.profiles.types import LLMBackend, LLMPreset, LLMProfile
+from kohakuterrarium.llm.profiles.resolve import (
     delete_backend,
     delete_profile,
     get_api_key,
@@ -108,9 +114,12 @@ from kohakuterrarium.llm.profiles import (
     save_profile,
     set_default_model,
 )
-from kohakuterrarium.llm.recovery import RetryPolicy
-from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
-from kohakuterrarium.llm.variations import (
+from kohakuterrarium.llm.recovery.errors import RetryPolicy
+from kohakuterrarium.llm.tools.build import (
+    build_provider_native_tools,
+    build_tool_schemas,
+)
+from kohakuterrarium.llm.profiles.variations import (
     apply_patch_map,
     apply_variation_groups,
     deep_merge_dicts,
@@ -123,10 +132,11 @@ from kohakuterrarium.modules.tool.base import (
     ToolContext,
     ToolResult,
 )
-from kohakuterrarium.llm.turn_segments import KT_ASSISTANT_SEGMENTS
+from kohakuterrarium.llm.stream.segments import KT_ASSISTANT_SEGMENTS
 from kohakuterrarium.session.store import SessionStore
 from tests.helpers.anthropic_stream import ANSWER as ANTHROPIC_ANSWER
 from tests.helpers.anthropic_stream import anthropic_provider
+from tests.helpers.parallel_tool_stream import RECORDED_CALLS, parallel_tool_provider
 from tests.helpers.reasoning_stream import (
     ANSWER,
     REASONING_PIECES,
@@ -134,7 +144,7 @@ from tests.helpers.reasoning_stream import (
     reasoning_segments,
 )
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = [pytest.mark.timeout(60), pytest.mark.real_llm_provider]
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +156,7 @@ pytestmark = pytest.mark.timeout(30)
 def isolated_llm_store(tmp_path, monkeypatch):
     """Isolate ``llm_profiles.yaml`` + ``api_keys.yaml`` via ``KT_CONFIG_DIR``.
 
-    Both ``llm/backends.py`` and ``llm/api_keys.py`` resolve their file
+    Both ``llm/profiles/backends.py`` and ``llm/profiles/api_keys.py`` resolve their file
     paths through ``utils.config_dir.config_dir`` — ``KT_CONFIG_DIR``
     is the single isolation seam (and keeps the suite from writing the
     operator's real ``~/.kohakuterrarium/``).  Tests that write the
@@ -162,7 +172,7 @@ def isolated_llm_store(tmp_path, monkeypatch):
     monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
 
     presets_mod._all_presets_cache = None
-    presets_mod._package_presets_merged = False
+    presets_mod._all_presets_key = None
     monkeypatch.setattr(presets_mod, "list_packages", lambda: [])
     monkeypatch.setattr(CodexTokens, "load", classmethod(lambda cls, path=None: None))
 
@@ -173,7 +183,7 @@ def isolated_llm_store(tmp_path, monkeypatch):
     yield
 
     presets_mod._all_presets_cache = None
-    presets_mod._package_presets_merged = False
+    presets_mod._all_presets_key = None
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +194,7 @@ def isolated_llm_store(tmp_path, monkeypatch):
 class _TranslateTool(BaseTool):
     """A real ``BaseTool`` with no builtin-schema entry.
 
-    Because ``translate`` is not in ``llm/tool_schemas.py:_BUILTIN_SCHEMAS``,
+    Because ``translate`` is not in ``llm/tools/schemas.py:_BUILTIN_SCHEMAS``,
     ``build_tool_schemas`` falls through to the tool's own
     ``get_parameters_schema()`` — the path custom / package tools take.
     """
@@ -479,6 +489,10 @@ class TestLlmIntegration:
             if e["provider"] in ("acme", "acme2")
         }
         assert acme_entries == {("acme", "acme-fast"), ("acme2", "acme-fast")}
+        ak.save_api_key("acme", "catalog-key")
+        assert next(e for e in list_all() if e["provider"] == "acme")["available"]
+        ak.save_api_key("acme", "")
+        assert not next(e for e in list_all() if e["provider"] == "acme")["available"]
 
         # 11. ``delete_backend`` refuses while a preset still binds to it,
         #     and refuses to drop a built-in provider entirely.
@@ -490,6 +504,7 @@ class TestLlmIntegration:
         assert delete_profile("acme-fast", provider="acme2") is True
         assert delete_backend("acme2") is True
         assert "acme2" not in backends_mod.load_backends()
+        assert not any(e["provider"] == "acme2" for e in list_all())
         # A bare-name delete with the name now unique under one provider.
         assert delete_profile("acme-fast") is True
         assert ("acme", "acme-fast") not in load_profiles()
@@ -858,13 +873,13 @@ class TestLlmIntegration:
         # ...and a non-alias name resolves to None (treat as canonical).
         assert resolve_alias("definitely-not-an-alias") is None
 
-        # 11. Package-declared ``llm_presets`` — ``presets._merge_package_presets``
+        # 11. Package-declared ``llm_presets`` — ``preset_packages.merge_package_presets``
         #     scans installed packages and folds NEW (provider, name)
         #     entries into the catalogue without overriding builtins.
         #     The autouse fixture stubbed ``list_packages`` empty; here
         #     we hand it a real package manifest and re-prime the cache.
         presets_mod._all_presets_cache = None
-        presets_mod._package_presets_merged = False
+        presets_mod._all_presets_key = None
         monkeypatch.setattr(
             presets_mod,
             "list_packages",
@@ -902,11 +917,11 @@ class TestLlmIntegration:
         assert not any(n == "no-provider" for (_p, n) in by_key)
         # The builtin codex/gpt-5.4 was NOT overridden by the package.
         assert by_key[("codex", "gpt-5.4")]["model"] != "hijacked"
-        # A second call is served from the cache (merge flag latched).
-        assert presets_mod._package_presets_merged is True
+        # Same installed-package set -> the cached catalogue is reused.
+        assert presets_mod.get_all_presets() is presets_mod.get_all_presets()
         # Reset so the autouse-fixture teardown leaves a clean slate.
         presets_mod._all_presets_cache = None
-        presets_mod._package_presets_merged = False
+        presets_mod._all_presets_key = None
 
     def test_build_tool_schemas_from_registry_workflow(self):
         """Drive the native tool-schema builder over a real registry.
@@ -921,7 +936,7 @@ class TestLlmIntegration:
         registry = Registry()
 
         # ``read`` is a real builtin tool with an entry in _BUILTIN_SCHEMAS.
-        from kohakuterrarium.builtins.tools.read import ReadTool
+        from kohakuterrarium.builtins.tools.files.read import ReadTool
 
         registry.register_tool(ReadTool())
         registry.register_tool(_TranslateTool())
@@ -1046,7 +1061,7 @@ class TestLlmIntegration:
         bad_call = NativeToolCall(id="c2", name="read", arguments="{not json")
         assert bad_call.parsed_arguments() == {"_raw": "{not json"}
 
-    @pytest.mark.timeout(60)
+    @pytest.mark.timeout(120)
     async def test_multimodal_message_round_trip_workflow(self, tmp_path, monkeypatch):
         """Build a full multimodal conversation and assert exact wire shape.
 
@@ -1152,7 +1167,9 @@ class TestLlmIntegration:
             ),
         )
         assert jpeg_result.success
-        assert jpeg_result.output[1].url == mislabeled.resolve().as_uri()
+        assert jpeg_result.output[1].url == (
+            "data:image/jpeg;base64," + base64.b64encode(expected_jpeg).decode("ascii")
+        )
         mime_wire = messages_to_dicts(
             [
                 UserMessage(
@@ -1615,8 +1632,9 @@ class TestLlmIntegration:
         context = ToolContext(agent_name="vision", session=None, working_dir=tmp_path)
         read_result = await ReadTool().execute({"path": source.name}, context=context)
         assert read_result.success
-        file_reference = read_result.output[1].url
-        assert file_reference == source.resolve().as_uri()
+        read_snapshot = read_result.output[1].url
+        assert read_snapshot == f"data:image/png;base64,{encoded}"
+        file_reference = source.resolve().as_uri()
 
         requests = []
 
@@ -1696,7 +1714,7 @@ class TestLlmIntegration:
             )
             artifact_reference = normalized.output[0].url
             assert artifact_reference.startswith("/api/sessions/media/artifacts/")
-            for reference in (file_reference, artifact_reference):
+            for reference in (read_snapshot, file_reference, artifact_reference):
                 edited = await tool.execute(
                     {"prompt": "add a border", "action": "edit", "image_url": reference}
                 )
@@ -1767,10 +1785,20 @@ class TestLlmIntegration:
                     )
                 )
                 await initial_client.close()
-                with pytest.raises(APIStatusError, match="allowed-local-media-path"):
+                repairs = []
+                chat_provider.on_context_repair(repairs.append)
+                with pytest.raises(
+                    MediaReferenceError, match="Required local media is unavailable"
+                ):
                     await chat_provider.chat_complete(chat_messages)
+                assert chat_requests == []
+                assert repairs == []
+                assert messages_to_dicts(chat_messages) == original_wire
+                valid_messages = [UserMessage(chat_messages[0].content[:-1])]
+                with pytest.raises(APIStatusError, match="allowed-local-media-path"):
+                    await chat_provider.chat_complete(valid_messages)
                 assert len(chat_requests) == 1
-                response = await chat_provider.chat_complete(chat_messages)
+                response = await chat_provider.chat_complete(valid_messages)
                 assert response.content == "same red square"
                 assert len(chat_requests) == 3
                 assert chat_requests[0] == chat_requests[1] == chat_requests[2]
@@ -1783,7 +1811,7 @@ class TestLlmIntegration:
                 assert messages_to_dicts(chat_messages) == original_wire
         finally:
             store.close()
-        assert len(requests) == 3
+        assert len(requests) == 4
 
         responses_requests = []
         reasoning_item = {
@@ -2031,6 +2059,83 @@ class TestLlmIntegration:
                 await responses_provider.chat_complete(budget_history)
             ).content == "bounded"
             assert budget_requests[2]["input"] == budget_requests[1]["input"]
+
+            session_store = SessionStore(
+                tmp_path / "custom-input-root" / "selected.kohakutr"
+            )
+            try:
+                session_store.write_artifact("current.png", image_bytes)
+                local_url = "/api/sessions/selected/artifacts/current.png"
+                missing_url = "/api/sessions/selected/artifacts/missing.png"
+                normal_read = Path.read_bytes
+                for scenario, role, urls, expected_images, should_fail in (
+                    (
+                        "budget-missing-old",
+                        "user",
+                        [missing_url] + [local_url] * 59,
+                        50,
+                        False,
+                    ),
+                    ("budget-valid", "user", [local_url] * 100, 50, False),
+                    ("assistant-unused", "assistant", [missing_url] * 40, 0, False),
+                    ("required-missing", "user", [missing_url], 0, True),
+                ):
+                    controller = Controller(
+                        responses_provider, ControllerConfig(include_job_status=False)
+                    )
+                    controller.session_store = session_store
+                    controller.conversation.append(
+                        role, [ImagePart(url=url) for url in urls]
+                    )
+                    originals = deepcopy(controller.conversation.to_messages())
+                    requests_before = len(budget_requests)
+                    reads = []
+
+                    def counted_read(path):
+                        if path.suffix == ".png" and ".artifacts" in str(path):
+                            reads.append(path)
+                        return normal_read(path)
+
+                    with monkeypatch.context() as request_patch:
+                        request_patch.setattr(Path, "read_bytes", counted_read)
+                        await controller.push_event(create_user_input_event("continue"))
+                        if should_fail:
+                            with pytest.raises(
+                                MediaReferenceError,
+                                match="Required local media is unavailable",
+                            ):
+                                async for _ in controller.run_once():
+                                    pass
+                        else:
+                            async for _ in controller.run_once():
+                                pass
+                    if should_fail:
+                        assert len(budget_requests) == requests_before
+                        continue
+                    assert len(budget_requests) == requests_before + 1, scenario
+                    sent_images = [
+                        part
+                        for item in budget_requests[-1]["input"]
+                        for part in item.get("content", [])
+                        if part.get("type") == "input_image"
+                    ]
+                    assert len(sent_images) == expected_images, scenario
+                    assert len(reads) == expected_images, scenario
+                    assert all(
+                        path == session_store.artifacts_dir / "current.png"
+                        for path in reads
+                    )
+                    assert all(
+                        base64.b64decode(part["image_url"].split(",", 1)[1])
+                        == image_bytes
+                        for part in sent_images
+                    )
+                    assert (
+                        controller.conversation.to_messages()[: len(originals)]
+                        == originals
+                    )
+            finally:
+                session_store.close()
 
             # Refused images leave the request and the host conversation alike.
             host = Conversation()
@@ -2304,9 +2409,7 @@ class TestLlmIntegration:
                             ],
                         }
                     ]
-                    # Deleting a previously sent file changes the request prefix.
-                    # Neither WS provider may replay the stale local URL or use
-                    # the previous response's image-bearing cached context.
+                    # Required missing media fails before a WS submission.
                     source.unlink()
                     ws_history.extend(
                         [
@@ -2315,9 +2418,19 @@ class TestLlmIntegration:
                         ]
                     )
                     saved_history = json.dumps(ws_history)
-                    assert [chunk async for chunk in ws_provider.chat(ws_history)] == [
-                        "continued"
+                    with pytest.raises(
+                        MediaReferenceError, match="Required local media is unavailable"
+                    ):
+                        _ = [chunk async for chunk in ws_provider.chat(ws_history)]
+                    assert len(ws_submissions) == 5
+                    assert json.dumps(ws_history) == saved_history
+                    without_file = [
+                        {**ws_history[0], "content": [ws_history[0]["content"][0]]},
+                        *ws_history[1:],
                     ]
+                    assert [
+                        chunk async for chunk in ws_provider.chat(without_file)
+                    ] == ["continued"]
                     assert len(ws_submissions) == 6
                     assert "previous_response_id" not in ws_submissions[5]
                     assert ws_submissions[5]["input"][0]["content"] == [
@@ -2478,7 +2591,35 @@ class TestLlmIntegration:
                     await provider.close()
 
         # A real agent executes a signed Google tool round and resumes its history.
-        for is_claude in (False, True):
+        for selector, wire, context, is_claude, output, thinking, summary in (
+            (
+                "google-antigravity/gemini-3.8-flash@reasoning=medium",
+                "gemini-3.8-flash-medium",
+                256000,
+                False,
+                65536,
+                {"thinkingBudget": 4000},
+                (4000, {"thinkingBudget": 2000}),
+            ),
+            (
+                "google-antigravity/gemini-4-argon@reasoning=medium,context=512k",
+                "gemini-4-argon-medium",
+                512000,
+                False,
+                65536,
+                {"thinkingLevel": "MEDIUM"},
+                (4096, {"thinkingLevel": "MEDIUM"}),
+            ),
+            (
+                "google-antigravity/claude-sonnet-5-5",
+                "claude-sonnet-5-5-medium",
+                256000,
+                True,
+                128000,
+                {"thinkingLevel": "MEDIUM"},
+                (4000, {"thinkingLevel": "MEDIUM"}),
+            ),
+        ):
             with monkeypatch.context() as agy_patch:
                 agy_patch.setattr(agy_auth.Path, "home", lambda: tmp_path)
                 agy_patch.setattr(
@@ -2510,23 +2651,13 @@ class TestLlmIntegration:
                         )
                     body = json.loads(request.content)
                     submissions.append(body)
-                    assert body["model"] == (
-                        "claude-sonnet-4-6" if is_claude else "gemini-3.8-flash-tiered"
+                    assert body["model"] == wire
+                    limit, config = (
+                        summary if len(submissions) == 4 else (output, thinking)
                     )
                     assert body["request"]["generationConfig"] == {
-                        "maxOutputTokens": (
-                            (3906 if is_claude else 4096)
-                            if len(submissions) == 4
-                            else (64000 if is_claude else 65536)
-                        ),
-                        "thinkingConfig": {
-                            "includeThoughts": True,
-                            **(
-                                {"thinkingBudget": 1024}
-                                if is_claude
-                                else {"thinkingLevel": "MEDIUM"}
-                            ),
-                        },
+                        "maxOutputTokens": limit,
+                        "thinkingConfig": {"includeThoughts": True, **config},
                     }
                     if len(submissions) == 1:
                         parts = [
@@ -2604,21 +2735,15 @@ class TestLlmIntegration:
                         200, text="data: " + json.dumps(data) + "\n\n"
                     )
 
-                agy = _create_from_profile(
-                    get_profile(
-                        "google-antigravity/claude-sonnet-4-6"
-                        if is_claude
-                        else "google-antigravity/gemini-3.8-flash@reasoning=medium"
-                    )
-                )
+                agy = _create_from_profile(get_profile(selector))
                 agy._transport = httpx.MockTransport(agy_http)
-                assert agy._profile_max_context == (250000 if is_claude else 1048576)
+                assert agy._profile_max_context == context
                 config = tmp_path / "agy.yaml"
                 config.write_text(
                     "name: agy_probe\nsystem_prompt: offline\ninput: {type: none}\noutput: {type: stdout}\ntools: [{name: scratchpad, type: builtin}]\n"
                 )
                 async with Terrarium(
-                    session_dir=tmp_path / f"agy-sessions-{is_claude}"
+                    session_dir=tmp_path / f"agy-sessions-{wire}"
                 ) as engine:
                     creature = await engine.add_creature(
                         str(config), llm=agy, io="headless", start=True
@@ -2636,8 +2761,8 @@ class TestLlmIntegration:
                         for part in signed[0]["_kt_antigravity_content"]["parts"]
                     )
                     session_path = creature.agent.session_store.path
-                    await creature.stop()
-                    assert not creature.is_running
+                    await engine.stop(creature)
+                    assert creature.status == "stopped"
                 resumed = await Terrarium.resume(str(session_path), llm=agy)
                 try:
                     worker = resumed.list_creatures()[0]
@@ -2653,8 +2778,6 @@ class TestLlmIntegration:
                         "AGY_COMPACT_SUMMARY" in (message.get("content") or "")
                         for message in snapshot
                     )
-                    await worker.stop()
-                    assert not worker.is_running
                 finally:
                     await resumed.__aexit__(None, None, None)
                 compacted = await Terrarium.resume(str(session_path), llm=agy)
@@ -2663,12 +2786,15 @@ class TestLlmIntegration:
                     assert (
                         await worker.run("after compact", timeout=10)
                     ).text == "AGY_OK"
+                    await compacted.remove_creature(worker)
+                    assert worker.creature_id not in compacted
+                    assert compacted.list_graphs() == []
                 finally:
                     await compacted.__aexit__(None, None, None)
                 assert len(submissions) == 5
 
     @pytest.mark.timeout(60)
-    async def test_dual_form_reasoning_stream_workflow(self):
+    async def test_dual_form_reasoning_stream_workflow(self, tmp_path):
         """A provider streaming reasoning in two forms per delta, end to end.
 
         Real ``OpenAIProvider`` over an in-memory HTTP stream: the displayed
@@ -2700,6 +2826,40 @@ class TestLlmIntegration:
             {"type": "reasoning.text", "index": 0, "text": full_text}
         ]
         assert KT_ASSISTANT_SEGMENTS not in echoed
+        await provider.close()
+
+        (tmp_path / "TASK.txt").write_text("PARALLEL_OK", encoding="utf-8")
+        (tmp_path / "notes.md").write_text("notes", encoding="utf-8")
+        parallel_requests = []
+        config = AgentConfig(
+            name="parallel",
+            tools=[ToolConfigItem(name="glob"), ToolConfigItem(name="read")],
+            fork_enabled=False,
+        )
+        async with Terrarium() as engine:
+            worker = await engine.add_creature(
+                config,
+                llm=await parallel_tool_provider(parallel_requests),
+                pwd=tmp_path,
+                io="headless",
+                session=False,
+            )
+            assert (await worker.run("inspect files", timeout=10)).text == "PARALLEL_OK"
+            serialized = worker.agent.controller.conversation.to_json()
+            snapshot = worker.agent.controller.conversation.snapshot_messages()
+            assistant = next(m for m in snapshot if m.get("tool_calls"))
+            assert [c["id"] for c in assistant["tool_calls"]] == [
+                c["id"] for c in RECORDED_CALLS
+            ]
+            assert assistant["_kt_tool_call_extra"] == {
+                RECORDED_CALLS[0]["id"]: RECORDED_CALLS[0]["extra_content"]
+            }
+            assert (await worker.run("continue", timeout=10)).text == "PARALLEL_OK"
+            worker.agent.controller.conversation.clear()
+            for message in Conversation.from_json(serialized).get_messages():
+                worker.agent.controller.conversation.append_message(message)
+            assert (await worker.run("restored", timeout=10)).text == "PARALLEL_OK"
+        assert len(parallel_requests) == 4
 
     @pytest.mark.timeout(60)
     async def test_anthropic_sampling_parameters_workflow(self):

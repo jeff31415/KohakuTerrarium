@@ -71,6 +71,7 @@
 
   <!-- User message -->
   <div v-else-if="message.role === 'user'" class="ml-auto group relative" :class="editing ? 'w-[min(760px,92%)] max-w-[92%]' : 'max-w-[80%]'">
+    <MessageDecorators position="header" :message="messageInfo" />
     <div class="kt-conversation-user-bubble chat-cv" :class="{ 'opacity-70': message.queued, 'user-message-editing': editing }">
       <div class="text-xs text-warm-400 mb-1 flex items-center gap-1.5">
         <span>You</span>
@@ -79,17 +80,22 @@
       <!-- Edit mode -->
       <div v-if="editing" class="message-edit-form flex flex-col gap-2.5">
         <div v-if="editAttachments.length" class="flex flex-wrap gap-2">
-          <div v-for="(attachment, idx) in editAttachments" :key="attachment.id || attachment.name + ':' + idx" class="flex items-center gap-2 px-2.5 py-1 rounded-lg bg-iolite/8 dark:bg-iolite/12 border border-iolite/20 text-xs">
+          <div v-for="(attachment, idx) in editAttachments" :key="attachment.id || attachment.name + ':' + idx" class="message-edit-attachment flex items-center gap-2 px-2.5 py-1 rounded-lg bg-iolite/8 dark:bg-iolite/12 border border-iolite/20 text-xs">
             <span :class="attachment.kind === 'image' ? 'i-carbon-image text-iolite dark:text-iolite-light' : 'i-carbon-document text-aquamarine'" />
             <span class="text-warm-700 dark:text-warm-200 max-w-52 truncate">{{ attachment.name }}</span>
-            <button class="text-warm-400 hover:text-coral" :disabled="editSaving" @click="removeEditAttachment(idx)">
+            <input :data-edit-target="String(idx)" type="file" :accept="attachment.kind === 'image' ? 'image/*' : undefined" class="hidden" :disabled="editSaving" @change="(e) => onEditFileChange(e, attachment.kind)" />
+            <button class="text-warm-400 hover:text-iolite dark:hover:text-iolite-light" :aria-label="t('chat.replaceAttachment', { name: attachment.name })" :disabled="editSaving" @click="($event) => $event.currentTarget.previousElementSibling?.click()">
+              <span class="i-carbon-renew" />
+            </button>
+            <button class="text-warm-400 hover:text-coral" :aria-label="t('chat.removeAttachment', { name: attachment.name })" :disabled="editSaving" @click="removeEditAttachment(idx)">
               <span class="i-carbon-close" />
             </button>
           </div>
         </div>
+        <p v-if="editTextRestricted" data-testid="edit-text-restricted" class="text-xs text-warm-500 dark:text-warm-400">{{ t("chat.editMergedTextDisabled") }}</p>
         <div class="message-edit-input-row flex gap-2 pl-2 pr-3 py-2 rounded-xl bg-warm-50 dark:bg-warm-800 border border-warm-200 dark:border-warm-700 focus-within:border-iolite/40 dark:focus-within:border-iolite-light/30 transition-colors items-end">
-          <input ref="editImageInputEl" type="file" accept="image/*" class="hidden" @change="(e) => onEditFileChange(e, 'image')" />
-          <input ref="editFileInputEl" type="file" class="hidden" @change="(e) => onEditFileChange(e, 'file')" />
+          <input ref="editImageInputEl" data-edit-role="add-image" type="file" accept="image/*" class="hidden" @change="(e) => onEditFileChange(e, 'image')" />
+          <input ref="editFileInputEl" data-edit-role="add-file" type="file" class="hidden" @change="(e) => onEditFileChange(e, 'file')" />
           <div class="message-edit-attach flex items-center gap-0 shrink-0 mb-0.5">
             <button class="w-10 h-10 sm:w-7 sm:h-7 flex items-center justify-center rounded-md transition-colors shrink-0 text-warm-400 hover:text-aquamarine dark:hover:text-aquamarine hover:bg-aquamarine/10 disabled:opacity-50" title="Attach file" aria-label="Attach file" :disabled="editSaving" @click="editFileInputEl?.click()">
               <span class="i-carbon-add text-sm sm:text-xs" />
@@ -98,12 +104,12 @@
               <span class="i-carbon-image text-sm sm:text-xs" />
             </button>
           </div>
-          <textarea ref="editTextareaEl" v-model="editText" class="message-edit-textarea message-edit-inline" :rows="Math.min(16, Math.max(6, editText.split('\n').length))" :disabled="editSaving" @keydown.meta.enter="confirmEdit" @keydown.ctrl.enter="confirmEdit" @keydown.esc="cancelEdit" />
+          <textarea ref="editTextareaEl" v-model="editText" class="message-edit-textarea message-edit-inline" :rows="Math.min(16, Math.max(6, editText.split('\n').length))" :disabled="editSaving" :readonly="editTextRestricted" @keydown.meta.enter="confirmEdit" @keydown.ctrl.enter="confirmEdit" @keydown.esc="cancelEdit" />
         </div>
         <div class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-warm-400 dark:text-warm-500 mr-auto">Ctrl/Cmd+Enter to rerun · Esc to cancel</span>
           <button class="px-2.5 py-1 rounded hover:bg-warm-100 dark:hover:bg-warm-800 disabled:opacity-50" :disabled="editSaving" @click="cancelEdit">Cancel</button>
-          <button class="px-2.5 py-1 rounded bg-sapphire text-white hover:bg-sapphire-shadow disabled:opacity-60" aria-label="Save and rerun" :disabled="editSaving || branchOperationBusy || (!editText.trim() && editAttachments.length === 0)" @click="confirmEdit">
+          <button class="px-2.5 py-1 rounded bg-sapphire text-white hover:bg-sapphire-shadow disabled:opacity-60" aria-label="Save and rerun" :disabled="editSaving || branchOperationBusy || (!editText.trim() && editAttachments.length === 0 && !editTextRestricted)" @click="confirmEdit">
             {{ editSaving ? "Starting..." : "Save & Rerun" }}
           </button>
         </div>
@@ -111,6 +117,7 @@
       <ConversationMessage v-else :message="message" :render-text="renderSharedText" :render-content-part="renderSharedContentPart" bare />
       <p v-if="editError || branchOperationError" class="mt-1 text-sm text-coral-shadow dark:text-coral-light" role="alert">{{ editError || branchOperationError }}</p>
     </div>
+    <MessageDecorators position="footer" :message="messageInfo" />
     <!-- Hover actions for user messages -->
     <div v-if="!editing && !message.queued && !message.injectedMidTurn && messageIdx != null" class="absolute -bottom-5 right-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--right">
       <!-- Branch navigator on user message: shown only when this turn
@@ -131,6 +138,7 @@
       <button class="msg-action-btn" title="Edit & rerun" aria-label="Edit and rerun message" :disabled="branchOperationBusy" :aria-busy="branchOperationBusy" @click="startEdit">
         <span class="i-carbon-edit text-xs" />
       </button>
+      <ActionButtons target="message" role="user" :context="actionContext" button-class="msg-action-btn" />
     </div>
   </div>
 
@@ -141,9 +149,11 @@
        keyed on the first tool's id so streaming new tools into an
        in-progress batch doesn't reshuffle ``expandedTools`` state. -->
   <div v-else-if="message.role === 'assistant' && message.parts" class="max-w-[90%] group relative">
+    <MessageDecorators position="header" :message="messageInfo" />
     <div class="chat-cv">
       <ConversationMessage :message="message" :render-text="renderSharedText" :render-content-part="renderSharedAssistantPart" bare />
     </div>
+    <MessageDecorators position="footer" :message="messageInfo" />
     <!-- Hover actions -->
     <div class="absolute -bottom-5 left-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--left">
       <!-- Branch navigator on the assistant bubble: shown only when
@@ -169,6 +179,7 @@
       <button class="msg-action-btn" title="Regenerate" aria-label="Regenerate response" :disabled="branchOperationBusy" :aria-busy="branchOperationBusy" @click="regenerate">
         <span class="i-carbon-renew text-xs" />
       </button>
+      <ActionButtons target="message" role="assistant" :context="actionContext" button-class="msg-action-btn" />
     </div>
   </div>
 
@@ -205,21 +216,32 @@
 
   <!-- Phase B output-event kinds (ask_text, confirm, selection, progress, notification, card) -->
   <ConversationMessage v-else-if="message.role === 'ui_event'" :message="message" :render-ui-event="renderSharedUIEvent" @reply="onUIEventReply" />
+
+  <!-- Widgets (renderer looked up in the widget registry) -->
+  <WidgetBlock v-else-if="message.role === 'widget'" :widget="widgetView" :host="widgetHost" />
 </template>
 
 <script setup>
 import { computed, h, inject, reactive, ref } from "vue"
 
+import AssistantText from "./AssistantText.vue"
 import CommandResultMessage from "../CommandResultMessage.vue"
 import ConversationMessage from "./ConversationMessage.js"
 import ToolCallBatch from "../ToolCallBatch.vue"
 import ToolCallBlock from "../ToolCallBlock.vue"
 import VideoFilePreview from "../VideoFilePreview.vue"
 import UIEventBlock from "../UIEventBlock.vue"
+import WidgetBlock from "../widgets/WidgetBlock.vue"
+import { sayToChat } from "../widgets/ktui/sayMessage.js"
+import { makeWidgetHost } from "../widgets/widgetHost.js"
+import { widgetFromMessage } from "../widgets/widgetModel.js"
 import MarkdownRenderer from "../../../public/chat/MarkdownRenderer.vue"
 import { MediaImage } from "../../../public/chat/MediaPreview.js"
 import { useMessageActions } from "../../../public/chat/messageActions.js"
 import { contentToText, useMessageRowActions } from "../../../public/chat/useMessageRowActions.js"
+import ActionButtons from "@/ext/ActionButtons.vue"
+import MessageDecorators from "@/ext/MessageDecorators.vue"
+import { useCanvasStore } from "@/stores/canvas"
 import { useChatStore } from "@/stores/chat"
 import { GEM } from "@/utils/colors"
 import { useI18n } from "@/utils/i18n"
@@ -275,7 +297,10 @@ function toggleTool(id) {
   expandedTools[id] = !expandedTools[id]
 }
 
-function renderSharedText(content, breaks = false) {
+function renderSharedText(content, breaks = false, options = null) {
+  if (options?.assistant) {
+    return h(AssistantText, { content, breaks, origin: markdownOrigin, streaming: options.streaming === true, canOpenCanvas: hostActions?.canvas !== false, uiStore: chat, uiAddress: uiAddress.value, onSay: sendUiMessage, onOpenCanvas: openUiInCanvas })
+  }
   return h(MarkdownRenderer, { content, breaks, origin: markdownOrigin })
 }
 
@@ -327,7 +352,9 @@ function renderSharedContentPart(part) {
 }
 
 const chat = inject("chatStore", null) || useChatStore()
+const canvasStore = inject("canvasStore", null) || useCanvasStore()
 const messageTab = computed(() => props.tabId || chat.activeTab)
+const uiAddress = computed(() => ({ tab: messageTab.value, turn: props.message.turnIndex, branch: props.message.branchId }))
 
 // Phase B UI event reply: route through the host seam so the VS Code webview
 // keeps its accepted-reply transport (never a raw store bypass) while the
@@ -341,11 +368,44 @@ function onUIEventReply({ actionId, values }) {
   chat.submitUIReply(messageTab.value, props.message.eventId, actionId, values || {})
 }
 
+// Widget transport: a renderer's messages and state go to the creature that
+// opened the widget, through the chat store.
+const widgetView = computed(() => (props.message.role === "widget" ? widgetFromMessage(props.message) : null))
+const widgetHost = makeWidgetHost({
+  store: chat,
+  tab: () => messageTab.value,
+  eventId: props.message.eventId,
+  canvas: canvasStore,
+  extra: { origin: markdownOrigin },
+})
+
+// Inline UI sends use the host's user-message transport when it has one.
+function sendUiMessage(text) {
+  return sayToChat(chat, text, t, hostActions?.sendText || null)
+}
+
+function openUiInCanvas({ source, title }) {
+  canvasStore.pinUi?.({ source, title })
+}
+
 const showSenderHeader = computed(() => {
   if (props.message.role !== "channel") return false
   if (!props.prevMessage || props.prevMessage.role !== "channel") return true
   return props.prevMessage.sender !== props.message.sender
 })
+
+// Read-only description of this message handed to extension actions and decorators.
+const messageInfo = computed(() => {
+  const message = props.message
+  const text = message.parts
+    ? message.parts
+        .filter((part) => part.type === "text" && part.content)
+        .map((part) => part.content)
+        .join("")
+    : contentToText(message.contentParts || message.content)
+  return { id: message.id ?? null, role: message.role, text, turn: message.turnIndex ?? null, tab: messageTab.value }
+})
+const actionContext = () => messageInfo.value
 
 const senderGemColor = computed(() => _gemForSender(props.message.sender))
 
@@ -353,7 +413,7 @@ const senderHomeNode = computed(() => resolveHomeNode(props.message))
 const siteChipNode = computed(() => (renderSiteChip ? renderSiteChip(senderHomeNode.value) : null))
 
 // ── Message actions (copy / edit / regenerate / branch navigators) ──
-const { editing, editText, editAttachments, editTextareaEl, editImageInputEl, editFileInputEl, editSaving, editError, branchOperationBusy, branchOperationError, copyMessage, copyAssistantText, startEdit, cancelEdit, onEditFileChange, removeEditAttachment, confirmEdit, regenerate, hasUserGroups, hasPrevUserGroup, hasNextUserGroup, goToPrevUserGroup, goToNextUserGroup, hasAssistantBranches, hasPrevAssistantBranch, hasNextAssistantBranch, goToPrevAssistantBranch, goToNextAssistantBranch } = useMessageRowActions({ props, chat, messageTab, writeClipboard, t })
+const { editing, editText, editAttachments, editTextRestricted, editTextareaEl, editImageInputEl, editFileInputEl, editSaving, editError, branchOperationBusy, branchOperationError, copyMessage, copyAssistantText, startEdit, cancelEdit, onEditFileChange, removeEditAttachment, confirmEdit, regenerate, hasUserGroups, hasPrevUserGroup, hasNextUserGroup, goToPrevUserGroup, goToNextUserGroup, hasAssistantBranches, hasPrevAssistantBranch, hasNextAssistantBranch, goToPrevAssistantBranch, goToNextAssistantBranch } = useMessageRowActions({ props, chat, messageTab, writeClipboard, t })
 </script>
 
 <style scoped>
@@ -418,7 +478,8 @@ const { editing, editText, editAttachments, editTextareaEl, editImageInputEl, ed
   }
 }
 
-.msg-action-btn {
+.msg-action-btn,
+:deep(.msg-action-btn) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -434,7 +495,8 @@ const { editing, editText, editAttachments, editTextareaEl, editImageInputEl, ed
     color 0.15s,
     border-color 0.15s;
 }
-.msg-action-btn:hover {
+.msg-action-btn:hover,
+:deep(.msg-action-btn:hover) {
   background: var(--color-card-hover);
   color: var(--color-text);
   border-color: var(--color-border-hover);

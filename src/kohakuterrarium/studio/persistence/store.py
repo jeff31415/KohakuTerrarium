@@ -13,9 +13,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
+from kohakuterrarium.session.occupancy.gate import acquire_legacy
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.store_lock import acquire_writer_lock, release_writer_lock
-from kohakuterrarium.studio.sessions import live as _live
+from kohakuterrarium.session.store.lifecycle.lock import (
+    acquire_writer_lock,
+    release_writer_lock,
+)
 from kohakuterrarium.studio.persistence.delete_family import (
     detach_file_family,
     remove_detached_family,
@@ -30,9 +33,10 @@ from kohakuterrarium.studio.persistence.viewer.paths import (
     pick_canonical_per_session,
     resolve_session_path,
 )
+from kohakuterrarium.studio.sessions import live as _live
 from kohakuterrarium.utils import drive_migration_lock
 from kohakuterrarium.utils.config_dir import config_dir
-from kohakuterrarium.utils.fs_path import coerce_fs_path
+from kohakuterrarium.utils.file.path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +44,7 @@ logger = get_logger(__name__)
 # Explicit session directories avoid this process-wide default when callers
 # require namespace isolation. Tests also replace the default directly.
 _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
+_IMPORT_SESSION_DIR = _SESSION_DIR
 
 
 def _session_dir() -> Path:
@@ -53,10 +58,8 @@ def _session_dir() -> Path:
     env = os.environ.get("KT_SESSION_DIR")
     if env:
         return coerce_fs_path(env)
-    # A replaced module default takes precedence; otherwise deriving from
-    # ``config_dir`` keeps configuration-directory overrides isolated.
-    _docs_default = Path.home() / ".kohakuterrarium" / "sessions"
-    if _SESSION_DIR != _docs_default:
+    # Replacement is judged against the import-time value, not a HOME read now.
+    if _SESSION_DIR != _IMPORT_SESSION_DIR:
         return _SESSION_DIR
     return config_dir() / "sessions"
 
@@ -210,7 +213,7 @@ def session_targets(store: SessionStore, meta: dict[str, Any]) -> list[str]:
             seen.add(target)
             targets.append(target)
 
-    for key_bytes in store.conversation.keys(limit=2**31 - 1):
+    for key_bytes in store.conversation.keys():
         target = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         if target and target not in seen:
             seen.add(target)
@@ -309,12 +312,40 @@ def _drive_sidecars_for(path: Path) -> list[Path]:
     ]
 
 
+def _path_identity(path: Path) -> str:
+    """Return the occupancy/lock identity for a session file path."""
+    return os.path.normcase(str(coerce_fs_path(path).expanduser().resolve()))
+
+
+def _unique_lock_authorities(targets: list[Path], suffix: str) -> list[str]:
+    """Return listed targets deduplicated by their physical lock-file identities."""
+    identities = {
+        os.path.normcase(str(path.parent.resolve() / path.name)) for path in targets
+    }
+    by_lock = {}
+    for path in sorted(identities):
+        by_lock.setdefault(_path_identity(Path(path + suffix)), path)
+    return [by_lock[key] for key in sorted(by_lock)]
+
+
+def _enroll_delete_targets(stack: ExitStack, targets: list[Path]) -> None:
+    """Enroll unique resolved identities for a handle-free delete worker.
+
+    Occupancy releases after family mutation, rollback, and lock unwind.
+    """
+    for key in sorted({_path_identity(path) for path in targets}):
+        lease = acquire_legacy(key, "delete")
+        stack.callback(lease.finish, source_released=True)
+
+
 def delete_session_files(session_name: str) -> list[Path]:
     """Delete a session file family and return the removed paths.
 
     Legacy raw stems use fuzzy resolution. An empty result means no matching
     session exists. Index entries are purged immediately so list and stats
-    views do not retain deleted sessions until reconciliation.
+    views do not retain deleted sessions until reconciliation. Occupancy uses
+    canonical source identities; writer/Drive locks protect listed targets without
+    adding file-symlink referents. Mutation and index cleanup retain original targets.
     """
     targets = all_versions_for_session_default(session_name)
     if not targets:
@@ -327,15 +358,16 @@ def delete_session_files(session_name: str) -> list[Path]:
     if not targets:
         return []
 
-    # Holding every writer and Drive migration lock before inspection makes
-    # deletion atomic with sidecar publication. Bounded acquisition fails before
-    # any removal when an active migration remains busy.
+    writer_paths = _unique_lock_authorities(targets, ".lock")
+    migration_paths = _unique_lock_authorities(targets, ".drives.migrate-lock")
+
     with ExitStack() as guards:
-        for path in sorted(targets, key=str):
-            lock = acquire_writer_lock(str(path))
+        _enroll_delete_targets(guards, targets)
+        for key in writer_paths:
+            lock = acquire_writer_lock(key)
             guards.callback(release_writer_lock, lock)
-        for path in sorted(targets, key=str):
-            guards.enter_context(drive_migration_lock.drive_migration_guard(path))
+        for key in migration_paths:
+            guards.enter_context(drive_migration_lock.drive_migration_guard(key))
 
         family = []
         for path in targets:

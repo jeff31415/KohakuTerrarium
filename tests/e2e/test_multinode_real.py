@@ -47,6 +47,7 @@ def _write_creature_config(
     system_prompt: str,
     *,
     subagents: list[str] | None = None,
+    tool_format: str | None = None,
 ) -> Path:
     """Write a realistic on-disk creature config dir.
 
@@ -58,7 +59,8 @@ def _write_creature_config(
 
     ``subagents`` — when given, each name is declared as a ``builtin``
     sub-agent on the creature so the worker builds the full VERTICAL
-    composition (controller → sub-agent) at spawn time.
+    composition (controller → sub-agent) at spawn time. ``tool_format``
+    overrides the ``bracket`` default those sub-agent creatures get.
     """
     cdir = root / f"creature_{name}"
     cdir.mkdir(parents=True, exist_ok=True)
@@ -71,8 +73,9 @@ def _write_creature_config(
         "input:\n  type: cli\n"
         "output:\n  type: stdout\n"
     )
+    if tool_format or subagents:
+        text += f"tool_format: {tool_format or 'bracket'}\n"
     if subagents:
-        text += "tool_format: bracket\n"
         text += "subagents:\n"
         for sa in subagents:
             text += f"  - name: {sa}\n    type: builtin\n"
@@ -120,6 +123,19 @@ async def _drain_chat_ws(
         elif ftype == "idle" and chunks:
             break
     return "".join(chunks)
+
+
+async def _recv_chat_turn(ws, reply_marker: str) -> list[dict]:
+    """Collect chat WS frames up to the ``idle`` that follows ``reply_marker``."""
+    frames: list[dict] = []
+    text = ""
+    while True:
+        frame = json.loads(await ws.recv())
+        frames.append(frame)
+        if frame.get("type") == "text":
+            text += str(frame.get("content", ""))
+        elif frame.get("type") == "idle" and reply_marker in text:
+            return frames
 
 
 @pytest.fixture(autouse=True)
@@ -1422,11 +1438,15 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
                 active = (await host.http.get("/api/sessions/active")).json()
                 assert sid not in {item["session_id"] for item in active}
 
+            active_ids = {
+                item["session_id"]
+                for item in (await host.http.get("/api/sessions/active")).json()
+            }
             for bad_ref, message in (
                 ("@missing-worker-package/creatures/general", "Package not installed"),
                 ("@worker-biome/missing", "Path not found in package"),
                 ("@worker-biome/../outside", "escapes the package root"),
-                ("@/creatures/general", "Empty package name"),
+                ("@/creatures/general", "The local project does not exist yet"),
                 ("creatures/general", "requires an absolute remote path"),
             ):
                 rejected = await host.http.post(
@@ -1435,6 +1455,8 @@ async def test_subprocess_worker_spawn_and_chat_round_trip(tmp_path, monkeypatch
                 )
                 assert rejected.status_code == 400, rejected.text
                 assert message in rejected.json()["detail"]
+            active = (await host.http.get("/api/sessions/active")).json()
+            assert {item["session_id"] for item in active} == active_ids
             assert package_config.is_dir()
 
 
@@ -1556,7 +1578,7 @@ async def test_spawn_chat_model_stop_creature_on_worker(tmp_path, monkeypatch):
                 host.http.delete(f"/api/sessions/active/agents/{creature_id}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop_resp.status_code in (200, 204), f"stop failed: {stop_resp.text}"
+            assert stop_resp.status_code == 200, f"stop failed: {stop_resp.text}"
             await RealLabHost._wait_for(
                 lambda: creature_id
                 not in {c.creature_id for c in worker.engine.list_creatures()},
@@ -1650,9 +1672,9 @@ async def test_worker_disconnect_drops_creature_and_keeps_api_responsive(
                 host.http.delete(f"/api/sessions/active/agents/{creature_id}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop_resp.status_code in (200, 204, 404), (
+            assert stop_resp.status_code == 404, (
                 f"stop of a gone creature returned {stop_resp.status_code} "
-                f"(expected a clean 200/204/404): {stop_resp.text}"
+                f"(expected 404): {stop_resp.text}"
             )
         finally:
             if not worker_closed:
@@ -1791,7 +1813,7 @@ async def test_two_workers_stop_one_keeps_everything_responsive(tmp_path, monkey
                 host.http.delete(f"/api/sessions/active/agents/{cid_a}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop.status_code in (200, 204), f"stop a failed: {stop.text}"
+            assert stop.status_code == 200, f"stop a failed: {stop.text}"
 
             # --- the API stays responsive -----------------------------
             listed = await asyncio.wait_for(
@@ -1920,7 +1942,7 @@ async def test_worker_creature_does_not_self_start_config_io(tmp_path, monkeypat
                 agent, "input_module", None
             )
             input_type = type(input_mod).__name__ if input_mod is not None else None
-            assert input_type in (None, "NoneInput"), (
+            assert input_type == "NoneInput", (
                 f"worker creature booted its config IO ({input_type}) — "
                 "API-spawned creatures must have input suppressed for attach"
             )
@@ -2037,7 +2059,7 @@ async def test_interrupt_worker_creature_routes_to_home(tmp_path, monkeypatch):
             intr = await asyncio.wait_for(
                 host.http.post(f"{base}/interrupt"), timeout=OP_TIMEOUT
             )
-            assert intr.status_code in (200, 204), (
+            assert intr.status_code == 200, (
                 f"interrupt did not route to the worker creature: "
                 f"{intr.status_code} {intr.text}"
             )
@@ -2254,9 +2276,8 @@ async def test_channel_add_and_list_on_worker_session(tmp_path, monkeypatch):
                 ),
                 timeout=OP_TIMEOUT,
             )
-            assert add.status_code in (
-                200,
-                201,
+            assert (
+                add.status_code == 200
             ), f"add channel on worker session failed: {add.text}"
 
             # List it back — must route to the worker too, not the host
@@ -2671,7 +2692,7 @@ async def test_identity_sync_host_to_worker(tmp_path, monkeypatch):
         "provider": "openai",
     }
     monkeypatch.setattr(
-        "kohakuterrarium.laboratory.adapters.studio_identity.list_profiles_payload",
+        "kohakuterrarium.laboratory.adapters.studio.identity.list_profiles_payload",
         lambda: [synced_profile],
     )
 
@@ -2762,7 +2783,7 @@ async def test_resume_happy_path_on_worker(tmp_path, monkeypatch):
                 host.http.delete(f"/api/sessions/active/agents/{creature_id}"),
                 timeout=OP_TIMEOUT,
             )
-            assert stop.status_code in (200, 204), f"stop failed: {stop.text}"
+            assert stop.status_code == 200, f"stop failed: {stop.text}"
             await RealLabHost._wait_for(
                 lambda: not worker.engine.list_creatures(),
                 "creature removed from worker after stop",
@@ -2900,11 +2921,34 @@ async def test_frontend_create_then_chat_attach_sequence_on_worker(
     Drives the literal frontend order — nodes → history → active →
     chat WS — and attaches BOTH by the engine ``creature_id`` AND by
     the creature's display ``name`` (the frontend's chat tab keys off
-    the friendly name, e.g. ``/creatures/quiet-meadow/chat``).
+    the friendly name, e.g. ``/creatures/quiet-meadow/chat``). A failed
+    tool call must then leave that same chat WS serving the reply, idle,
+    and a second turn.
     """
     monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "host-sessions"))
-    install_scripted_llm(monkeypatch, script=["attach reply ok"])
-    cfg_dir = _write_creature_config(tmp_path, "attachme", "You attach.")
+    install_scripted_llm(
+        monkeypatch,
+        script=[
+            ScriptEntry(response="attach reply ok"),
+            ScriptEntry(
+                response=(
+                    "[/send_channel]\n"
+                    "@@channel=attach-missing-ch\n"
+                    "@@message=probe\n"
+                    "[send_channel/]"
+                ),
+                match="tool error probe",
+            ),
+            ScriptEntry(
+                response="recovered after tool error", match="attach-missing-ch"
+            ),
+            ScriptEntry(response="second turn reply", match="second turn probe"),
+            ScriptEntry(response="attach reply ok"),
+        ],
+    )
+    cfg_dir = _write_creature_config(
+        tmp_path, "attachme", "You attach.", tool_format="bracket"
+    )
 
     async with RealLabHost(tmp_path) as host:
         async with RealLabWorker("worker-1", host.lab_ws_url, tmp_path / "worker-1"):
@@ -2958,11 +3002,44 @@ async def test_frontend_create_then_chat_attach_sequence_on_worker(
                 reply_by_name = await asyncio.wait_for(
                     _drain_chat_ws(ws, "ping"), timeout=OP_TIMEOUT
                 )
-            assert "attach reply ok" in reply_by_name, (
-                f"chat attach by creature NAME {creature_name!r} streamed "
-                f"{reply_by_name!r} — the frontend keys its chat tab off "
-                "the display name and the WebSocket closes empty"
-            )
+                assert "attach reply ok" in reply_by_name, (
+                    f"chat attach by creature NAME {creature_name!r} streamed "
+                    f"{reply_by_name!r} — the frontend keys its chat tab off "
+                    "the display name and the WebSocket closes empty"
+                )
+
+                # A failed tool call leaves this connection usable.
+                await ws.send(
+                    json.dumps({"type": "input", "content": "tool error probe"})
+                )
+                frames = await asyncio.wait_for(
+                    _recv_chat_turn(ws, "recovered after tool error"),
+                    timeout=OP_TIMEOUT,
+                )
+                tool_errors = [f for f in frames if f.get("type") == "tool_error"]
+                assert tool_errors, f"no tool_error frame before idle: {frames}"
+                assert "attach-missing-ch" in str(
+                    tool_errors[0].get("error")
+                ), f"tool_error does not describe the failed send: {tool_errors[0]}"
+                after_error = frames[frames.index(tool_errors[0]) :]
+                recovered = "".join(
+                    str(f.get("content", ""))
+                    for f in after_error
+                    if f.get("type") == "text"
+                )
+                assert (
+                    "recovered after tool error" in recovered
+                ), f"reply did not follow the tool_error frame: {frames}"
+
+                await ws.send(
+                    json.dumps({"type": "input", "content": "second turn probe"})
+                )
+                second = await asyncio.wait_for(
+                    _recv_chat_turn(ws, "second turn reply"), timeout=OP_TIMEOUT
+                )
+                assert not [
+                    f for f in second if f.get("type") == "error"
+                ], f"second turn on the same chat WS reported an error: {second}"
 
 
 # ===========================================================================

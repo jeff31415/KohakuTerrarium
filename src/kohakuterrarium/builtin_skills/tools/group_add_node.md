@@ -1,6 +1,6 @@
 ---
 name: group_add_node
-description: 'Spawn a creature into your group from a config path. Not for one-shot private work - dispatch a sub-agent.'
+description: 'Spawn a creature into your group from a config path. Use it to add a long-lived teammate. Not for one-shot work - dispatch a sub-agent.'
 category: builtin
 tags: [group]
 ---
@@ -15,7 +15,7 @@ Adds a new creature to your graph and links it to you as its parent.
 | --- | --- | --- | --- |
 | config_path | string | yes | Creature folder or `@pkg/...` reference |
 | name | string | no | Runtime name; defaults to the config's |
-| llm | string | no | Model override for the new member |
+| llm | string | no | Model selector; defaults to the config's model, else yours |
 | pwd | string | no | Working directory; defaults to yours |
 
 ## Behavior

@@ -9,7 +9,7 @@ import asyncio
 import uuid
 from typing import Any
 
-from kohakuterrarium.laboratory._internal.app import AppMessage
+from kohakuterrarium.laboratory._internal.app.app import AppMessage
 from kohakuterrarium.laboratory.protocols import LabRegistrar, LabSender
 from kohakuterrarium.utils.logging import get_logger
 
@@ -184,7 +184,7 @@ class RemoteStream:
         if frame.get("eof"):
             await self._close_local()
             raise StopAsyncIteration
-        if "error" in frame:
+        if "type" not in frame and isinstance(frame.get("error"), dict):
             err = frame["error"]
             await self._close_local()
             raise RemoteStreamError(err.get("kind", "unknown"), err.get("message", ""))

@@ -7,6 +7,7 @@ channel history and live messages through the same websocket.
 
 import asyncio
 import time
+from functools import partial
 from typing import Any
 
 from fastapi import WebSocket
@@ -18,7 +19,7 @@ from kohakuterrarium.studio._runtime import host_engine_or_none
 from kohakuterrarium.studio.attach._event_stream import (
     StreamOutput,
     get_event_log,
-    model_recovery_snapshot,
+    session_info_frame as _session_info_frame,
 )
 from kohakuterrarium.studio.attach.input_ops import (
     _handle_pending_op,
@@ -27,50 +28,17 @@ from kohakuterrarium.studio.attach.input_ops import (
     _resolve_target,
 )
 from kohakuterrarium.studio.attach.io_cluster import attach_io_cluster
-from kohakuterrarium.studio.sessions.cluster_fold import cluster_groups
+from kohakuterrarium.studio.attach.widget_frames import (
+    WIDGET_CLIENT_FRAMES,
+    apply_client_hello,
+    handle_widget_frame,
+)
+from kohakuterrarium.studio.sessions.cluster.fold import cluster_groups
 from kohakuterrarium.studio.sessions.lifecycle import find_creature
 from kohakuterrarium.terrarium import TerrariumService
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def _session_info_frame(creature: Any) -> dict[str, Any]:
-    """Build the per-creature ``session_info`` frame sent at attachment.
-
-    The shape matches model-switch events so initial and updated tab state use the
-    same canonical LLM name, raw model ID, and context limits. ``source`` must be the
-    creature display name because the client keys model metadata by tab name.
-    """
-    agent = creature.agent
-    try:
-        llm_name = agent.llm_identifier()
-    except Exception:
-        llm_name = ""
-    llm = getattr(agent, "llm", None)
-    model = getattr(llm, "model", "") or getattr(agent.config, "model", "") or ""
-    max_context = getattr(llm, "_profile_max_context", 0) or 0
-    compact_manager = getattr(agent, "compact_manager", None)
-    compact_at = 0
-    if compact_manager is not None and max_context:
-        try:
-            compact_at = int(max_context * compact_manager.config.threshold)
-        except Exception:
-            compact_at = 0
-    return {
-        "type": "activity",
-        "activity_type": "session_info",
-        "source": creature.name,
-        "model": model,
-        "llm_name": llm_name,
-        "agent_name": creature.name,
-        "config_name": getattr(creature, "config_name", ""),
-        "config_ref": getattr(creature, "config_ref", None),
-        "max_context": max_context,
-        "compact_threshold": compact_at,
-        "model_recovery": model_recovery_snapshot(agent),
-        "ts": time.time(),
-    }
 
 
 def _handle_ui_reply(
@@ -127,6 +95,33 @@ def _handle_ui_reply(
         queue.put_nowait(ack)
     except asyncio.QueueFull:
         logger.debug("ui_reply_ack dropped — queue full")
+
+
+def _handle_widget_frame(
+    data: dict[str, Any],
+    msg_type: str,
+    engine: Any,
+    creature: Any,
+    session_id: str,
+    outputs: dict[int, Any],
+    queue: asyncio.Queue,
+) -> None:
+    """Route a client widget frame to the addressed creature's widget service."""
+    if msg_type == "client_hello":
+        apply_client_hello(data, outputs.values())
+        return
+    try:
+        target = _resolve_target(engine, creature, session_id, data)
+    except KeyError:
+        target = creature
+    handle_widget_frame(
+        msg_type,
+        data,
+        target.agent,
+        outputs.get(id(target.agent)),
+        target.name,
+        queue.put_nowait,
+    )
 
 
 async def _forward_queue(queue: asyncio.Queue, ws: WebSocket) -> None:
@@ -371,6 +366,20 @@ async def attach_io(
             if msg_type == "ui_dismiss":
                 # Display-only dismissals require no pending-future resolution.
                 continue
+            if msg_type in WIDGET_CLIENT_FRAMES:
+                _handle_widget_frame(
+                    data,
+                    msg_type,
+                    engine,
+                    creature,
+                    session_id,
+                    {
+                        id(agent): out_module,
+                        **{id(a): m for a, m in sibling_modules},
+                    },
+                    queue,
+                )
+                continue
             if msg_type in ("input_edit", "input_cancel"):
                 # Pending operations are valid only until the mid-turn drain claims the ID.
                 _handle_pending_op(data, msg_type, engine, creature, session_id, queue)
@@ -410,6 +419,7 @@ async def attach_io(
                 "source": target_creature.name,
                 "content": content,
                 "event_id": pending_id,
+                "pending_id": pending_id,
                 "ts": time.time(),
             }
             log.append(user_evt)
@@ -417,7 +427,13 @@ async def attach_io(
             # Do not block delivery of replies that the injected turn may await.
             task = asyncio.create_task(
                 _process_input(
-                    target_agent, content, queue, target_creature.name, pending_id
+                    target_agent,
+                    content,
+                    queue,
+                    target_creature.name,
+                    pending_id,
+                    branch_view=data.get("branch_view"),
+                    wake=partial(engine.wake, target_creature),
                 )
             )
             input_tasks.append(task)

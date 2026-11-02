@@ -14,9 +14,16 @@ from pathlib import Path
 
 import pytest
 
+from kohakuterrarium.builtins.plugins.apps.plugin import FULL_PAGE_PART
+from kohakuterrarium.builtins.plugins.ui_declarative.reference import (
+    inline_ui_section,
+)
+from kohakuterrarium.builtins.tools.app.show import ShowAppTool
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config import load_agent_config
-from kohakuterrarium.llm.tools import build_tool_schemas
+from kohakuterrarium.core.config.load import load_agent_config
+from kohakuterrarium.llm.tools.schemas import _BUILTIN_SCHEMAS
+from kohakuterrarium.llm.tools.build import build_tool_schemas
+from kohakuterrarium.prompt.presentation import CLOSING, HEADING, OPENING
 from kohakuterrarium.testing.llm import ScriptedLLM
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "creatures" / "budget_ref"
@@ -31,8 +38,26 @@ MAX_CALLABLES = 20
 # more than a flat one; the aggregate budget above is the real constraint.
 MAX_SCHEMA_CHARS = 1_500
 MAX_TOOL_GUIDANCE_CHARS = 600
+MAX_WIDGET_GUIDANCE_CHARS = 900
+# ``## Presenting your answer`` with the inline-UI reference and the app part.
+# Components past the common set are named only (``info("ui:<name>")``).
+MAX_PRESENTATION_CHARS = 7_000
+# The same section when ``info`` is not callable and every component is inline.
+MAX_PRESENTATION_INLINE_CHARS = 9_000
 
 BACKGROUND_CAPABLE = {"bash", "python", "web_fetch", "web_search"}
+
+
+@pytest.fixture
+def reference_workspace(tmp_path, monkeypatch):
+    """Provide an empty user home and working directory for the reference agent."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    return workspace
 
 
 def _measure(agent, mode):
@@ -49,7 +74,7 @@ def _measure(agent, mode):
 
 class TestPromptBudget:
     @pytest.mark.asyncio
-    async def test_framework_payload_stays_within_budget(self):
+    async def test_framework_payload_stays_within_budget(self, reference_workspace):
         config = load_agent_config(str(FIXTURE))
         assert config.tool_format == "native"
         # kt-biome ships `full`; both modes are measured explicitly below so
@@ -59,7 +84,11 @@ class TestPromptBudget:
         # ── standard: the lean mode ────────────────────────────────────
         config.tool_doc_mode = "standard"
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            pwd=str(reference_workspace),
+            io="headless",
+            strict=False,
         )
         try:
             standard_chars, schemas = _measure(agent, "standard")
@@ -77,6 +106,7 @@ class TestPromptBudget:
             # not repeat it, in prose or as a sub-agent list.
             assert "## Available Functions" not in prompt
             assert "## Available Sub-Agents" not in prompt
+            assert "## Skills" not in prompt
 
             # No call-syntax prose for a format that has none.
             assert "## Calling functions" not in prompt
@@ -112,10 +142,25 @@ class TestPromptBudget:
         finally:
             await agent.stop()
 
+        # ``## Presenting your answer`` is the main output vocabulary when a
+        # client draws kt.ui and kt.app; with both parts it stays capped.
+        section = "\n\n".join(
+            [HEADING, OPENING, inline_ui_section(), FULL_PAGE_PART, CLOSING]
+        )
+        assert len(section) <= MAX_PRESENTATION_CHARS, len(section)
+        inline = "\n\n".join(
+            [HEADING, OPENING, inline_ui_section(False), FULL_PAGE_PART, CLOSING]
+        )
+        assert len(inline) <= MAX_PRESENTATION_INLINE_CHARS, len(inline)
+
         # ── full: every usage tier inlined; the shipped default ────────
         config.tool_doc_mode = "full"
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            pwd=str(reference_workspace),
+            io="headless",
+            strict=False,
         )
         try:
             full_chars, _ = _measure(agent, "full")
@@ -131,8 +176,18 @@ class TestPromptBudget:
         finally:
             await agent.stop()
 
+        # ── plugin-contributed widget tools: guidance and schema caps ──
+        # These tools appear only while a client renders them; when they do,
+        # the default host preset is the longest guidance they can carry.
+        app_tool = ShowAppTool()
+        assert len(app_tool.prompt_contribution()) <= MAX_WIDGET_GUIDANCE_CHARS
+        assert len(json.dumps(_BUILTIN_SCHEMAS["show_app"])) <= MAX_SCHEMA_CHARS
+        assert len(app_tool.description) <= 160
+
     @pytest.mark.asyncio
-    async def test_per_tool_full_override_costs_only_that_tool(self):
+    async def test_per_tool_full_override_costs_only_that_tool(
+        self, reference_workspace
+    ):
         # A creature on `standard` can still opt one tool into the usage tier,
         # and pays for that tool alone.
         config = load_agent_config(str(FIXTURE))
@@ -141,7 +196,11 @@ class TestPromptBudget:
             entry.doc_mode = "full" if entry.name == "multi_edit" else None
 
         agent = await Agent.build(
-            config, llm=ScriptedLLM(["ok"]), io="headless", strict=False
+            config,
+            llm=ScriptedLLM(["ok"]),
+            pwd=str(reference_workspace),
+            io="headless",
+            strict=False,
         )
         try:
             prompt = agent._controller_config.system_prompt

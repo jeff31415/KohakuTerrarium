@@ -1,9 +1,16 @@
 import { ElMessage } from "element-plus"
 import { getCurrentInstance, markRaw, toRaw } from "vue"
+import { snapshotContent } from "@/public/chat/contentSnapshot"
 import { extractReasoning, mergeReasoningSegments } from "@/utils/chatReasoning"
 import { reduceModelRecovery } from "./chatRecovery"
+import { inlineUiActions } from "./chatInlineUi"
 
-import { injectScope, registerScopeDisposer, scopeOfStoreId } from "@/composables/useScope"
+import {
+  injectScope,
+  disposeScopeStore,
+  registerScopeDisposer,
+  scopeOfStoreId,
+} from "@/composables/useScope"
 import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
 import {
   attentionSummary,
@@ -25,6 +32,7 @@ import {
 } from "@/stores/chatCommandResults"
 import { useClusterStore } from "@/stores/cluster"
 import { useInstancesStore } from "@/stores/instances"
+import { useHostsStore } from "@/stores/hosts"
 import { useLocaleStore } from "@/stores/locale"
 import { useMessagesStore } from "@/stores/messages"
 import { useNotificationsStore } from "@/stores/notifications"
@@ -32,6 +40,9 @@ import { useStatusStore } from "@/stores/status"
 import { agentAPI, sessionAPI, terrariumAPI } from "@/utils/api"
 import { createHistoryPageController } from "@/stores/historyPageController"
 import { translate } from "@/utils/i18n"
+import { ensureBuiltinWidgetRenderers } from "@/components/chat/widgets/builtin"
+import { legacyKindOf } from "@/components/chat/widgets/widgetModel"
+import { helloRenderers, watchHelloRenderers } from "@/ext/widgets"
 import { readLocalJsonPref, writeLocalJsonPref } from "@/utils/uiPrefs"
 import { wsUrl } from "@/utils/wsUrl"
 
@@ -92,6 +103,12 @@ const ATTENTION_SUMMARY_MAX = 200
 // matter how long the turn streams.
 const ATTENTION_ACCUMULATOR_CEILING = ATTENTION_SUMMARY_MAX * 2
 
+/** A frame after which no tool call is still streaming its arguments. */
+function endsToolArgsProgress(data) {
+  if (["processing_end", "idle", "text", "processing_error"].includes(data.type)) return true
+  return data.type === "activity" && ["tool_start", "subagent_start"].includes(data.activity_type)
+}
+
 function _truncateAttentionSummary(text) {
   const flat = String(text || "")
     .replace(/\s+/g, " ")
@@ -129,9 +146,12 @@ function _accumulateAttentionStreamText(accumulated, chunk) {
  * when the user is viewing a different branch, and a text-less turn
  * summaries to "" instead of surfacing a stale earlier turn.
  */
+const WIDGET_STATE_DEBOUNCE_MS = 500
+
 function _attentionEdgeSummary(data, streamedText) {
-  if (ATTENTION_INTERACTIVE_TYPES.includes(data.type)) {
-    const payload = data.payload || {}
+  const legacyWidget = data.type === "widget" && legacyKindOf(data.payload?.renderer)
+  if (ATTENTION_INTERACTIVE_TYPES.includes(data.type) || legacyWidget) {
+    const payload = legacyWidget ? data.payload?.spec || {} : data.payload || {}
     return _truncateAttentionSummary(
       payload.prompt || payload.body || payload.text || payload.title,
     )
@@ -140,11 +160,134 @@ function _attentionEdgeSummary(data, streamedText) {
   return ""
 }
 
+/** A chat message for a recorded ``widget`` row (legacy kinds map to ``ui_event``). */
+function _widgetMessageFromRow(evt, tab) {
+  const widgetId = evt.widget_id
+  if (!widgetId) return null
+  const kind = legacyKindOf(evt.renderer)
+  if (kind) {
+    return _legacyWidgetMessage(tab, widgetId, kind, evt.spec || {}, {
+      interactive: !!evt.interactive,
+      surface: evt.surface || "chat",
+      timestamp: "",
+    })
+  }
+  return _genericWidgetMessage(tab, widgetId, {
+    renderer: evt.renderer,
+    version: evt.version,
+    title: evt.title,
+    spec: evt.spec,
+    state: evt.state,
+    fallback: evt.fallback,
+    routing: evt.routing,
+    interactive: !!evt.interactive,
+    surface: evt.surface,
+    timestamp: "",
+  })
+}
+
+function _legacyWidgetMessage(tab, eventId, kind, payload, { interactive, surface, timestamp }) {
+  return {
+    id: `ui_${eventId}`,
+    role: "ui_event",
+    uiEventType: kind,
+    eventId,
+    payload,
+    interactive,
+    surface: surface || "chat",
+    tab,
+    timestamp,
+    replied: false,
+    superseded: false,
+    timedOut: false,
+    repliedActionId: "",
+    repliedValues: null,
+    viaWidget: true,
+  }
+}
+
+function _genericWidgetMessage(tab, eventId, payload) {
+  return {
+    id: `w_${eventId}`,
+    role: "widget",
+    eventId,
+    renderer: payload.renderer || "",
+    version: payload.version || 1,
+    title: payload.title || "",
+    spec: payload.spec ?? null,
+    state: { ...(payload.state || {}) },
+    fallback: payload.fallback || "",
+    routing: payload.routing || "agent",
+    awaiting: payload.awaiting === true,
+    interactive: payload.interactive === true,
+    surface: payload.surface || "chat",
+    tab,
+    timestamp: payload.timestamp ?? new Date().toISOString(),
+    closed: false,
+    closeReason: "",
+    lastAck: null,
+  }
+}
+
+/** Apply a widget patch (``spec`` replace, ``state`` merge, ``title``, ``fallback``, ``awaiting``). */
+function _applyWidgetPatch(message, patch) {
+  if (!patch || typeof patch !== "object") return
+  if (message.role === "ui_event") {
+    if (patch.spec && typeof patch.spec === "object") message.payload = patch.spec
+    return
+  }
+  if ("spec" in patch) message.spec = patch.spec
+  if (patch.state && typeof patch.state === "object")
+    message.state = { ...message.state, ...patch.state }
+  if (typeof patch.title === "string") message.title = patch.title
+  if (typeof patch.fallback === "string") message.fallback = patch.fallback
+  if (typeof patch.awaiting === "boolean") message.awaiting = patch.awaiting
+}
+
+/** Close a widget message; legacy kinds keep their answered / elsewhere / timed-out flags. */
+function _closeWidgetMessage(message, reason = "") {
+  if (message.role === "ui_event") {
+    if (message.replied) return
+    if (reason === "timeout") message.timedOut = true
+    else message.superseded = true
+    return
+  }
+  message.closed = true
+  message.closeReason = reason || ""
+  message.awaiting = false
+}
+
+/** Replay one recorded widget row onto its message. */
+function _applyWidgetRow(message, type, evt) {
+  switch (type) {
+    case "widget_update":
+      _applyWidgetPatch(message, evt.patch)
+      break
+    case "widget_state":
+      if (message.role === "widget" && evt.state && typeof evt.state === "object") {
+        message.state = { ...evt.state }
+      }
+      break
+    case "widget_message":
+      if (message.role === "ui_event") {
+        message.replied = true
+        message.repliedActionId = evt.name || ""
+        message.repliedValues = evt.data || null
+      }
+      break
+    case "widget_close":
+      _closeWidgetMessage(message, evt.reason || "")
+      break
+  }
+}
+
 function normalizeMessageContent(content) {
-  const contentParts = normalizeContentParts(content)
+  const rawContent = Array.isArray(content) ? snapshotContent(content) : content
+  const contentParts = normalizeContentParts(rawContent)
   return {
     content: typeof content === "string" ? content : extractTextContent(content),
     contentParts,
+    rawContent,
   }
 }
 
@@ -197,10 +340,8 @@ function _insertReasoningSegments(message, rawSegments, idPrefix = "reasoning_")
 }
 
 function contentSignature(content) {
-  if (typeof content === "string") return `text:${content}`
-  const normalized = normalizeContentParts(content)
-  if (!normalized) return ""
-  return JSON.stringify(normalized)
+  if (typeof content === "string") return JSON.stringify([{ type: "text", text: content }])
+  return Array.isArray(content) ? JSON.stringify(content) : ""
 }
 
 // ── Per-tab message indexes (module-level by design) ──
@@ -299,23 +440,6 @@ export function _parseSlashCommand(content) {
   return { command: match[1].toLowerCase(), args: match[2] || "" }
 }
 
-function textSignature(content) {
-  // Coarser comparator used as a fallback by ``_handleUserInputInjected``
-  // when the strict ``contentSignature`` comparison fails. Strips
-  // multimodal parts and trims whitespace so a queue entry whose
-  // ``contentParts`` slightly differs from the backend's drained
-  // ``data.content`` (extra image part, mismatched dict-vs-typed
-  // shape, trailing whitespace) still matches by the text the user
-  // actually typed. Returns ``""`` when no text content present.
-  if (typeof content === "string") return content.trim()
-  if (!Array.isArray(content)) return ""
-  return content
-    .filter((p) => p && typeof p === "object" && p.type === "text")
-    .map((p) => String(p.text || "").trim())
-    .join("\n")
-    .trim()
-}
-
 function toolResultPayload(result, data = {}) {
   // Backend flattens whitelisted metadata fields onto the top level
   // of the WS frame (see ``_STREAM_METADATA_KEYS`` in
@@ -369,6 +493,7 @@ export function _convertHistory(messages, options = {}) {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: "",
         ...(paged ? { _historyKey: [id], _historyKeys: [id] } : {}),
       })
@@ -389,6 +514,7 @@ export function _convertHistory(messages, options = {}) {
         _fallbackReasoning: !Array.isArray(msg._kt_assistant_segments) ? extractReasoning(msg) : [],
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: "",
         tool_calls: tcs.length ? tcs : undefined,
         ...(paged ? { _historyKey: [id], _historyKeys: [id] } : {}),
@@ -525,7 +651,30 @@ function _pathMatches(path, selected, beforeTurn = Infinity) {
   return true
 }
 
-function _resolveSelectedBranches(events, parentPaths, branchView) {
+function _branchMatchesViewedAncestors(events, view, turnIndex, branchId, fallbackPath) {
+  const parentPaths = _indexParentPaths(events || [])
+  const selected = _resolveSelectedBranches(events || [], parentPaths, view)
+  const anchor = events?.find(
+    (event) => event?.turn_index === turnIndex && event?.branch_id === branchId,
+  )
+  const path = anchor
+    ? Array.isArray(anchor.parent_branch_path)
+      ? _coercePath(anchor.parent_branch_path)
+      : parentPaths.get(anchor.event_id) || []
+    : _coercePath(fallbackPath)
+  for (const [turn, branch] of Object.entries(view || {})) {
+    if (!selected.has(Number(turn))) selected.set(Number(turn), branch)
+  }
+  return _pathMatches(path, selected, turnIndex)
+}
+
+function _resolveSelectedBranches(
+  events,
+  parentPaths,
+  branchView,
+  retainUnmatchedOverrides = true,
+  liveBranch = null,
+) {
   const branchesByTurn = new Map()
   for (const evt of events) {
     const ti = evt?.turn_index
@@ -540,6 +689,13 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
     }
     if (!bucket.some((entry) => entry.branch === bi)) {
       bucket.push({ path, branch: bi })
+    }
+  }
+  if (liveBranch) {
+    const bucket = branchesByTurn.get(liveBranch.turnIndex) || []
+    if (!bucket.some((entry) => entry.branch === liveBranch.branchId)) {
+      bucket.push({ path: _coercePath(liveBranch.parentBranchPath), branch: liveBranch.branchId })
+      branchesByTurn.set(liveBranch.turnIndex, bucket)
     }
   }
   const selected = new Map()
@@ -562,13 +718,28 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
       // Returning ``requested`` keeps the predicted branch sticky;
       // ``liveIds`` then renders empty for that (turn, branch) until
       // the real events land. The next resync rebuilds correctly.
-      selected.set(ti, requested)
-      continue
+      if (retainUnmatchedOverrides) {
+        selected.set(ti, requested)
+        continue
+      }
     }
     if (!candidates.length) continue
     selected.set(ti, Math.max(...candidates.map((entry) => entry.branch)))
   }
   return selected
+}
+
+export function _normalizeBranchView(view) {
+  if (!view || typeof view !== "object" || Array.isArray(view)) return {}
+  const out = {}
+  for (const [rawTurn, rawBranch] of Object.entries(view)) {
+    const turn = Number(rawTurn)
+    const branch = Number(rawBranch)
+    if (Number.isInteger(turn) && turn > 0 && Number.isInteger(branch) && branch > 0) {
+      out[turn] = branch
+    }
+  }
+  return out
 }
 
 export function _collectBranchMetadata(events, branchView = null) {
@@ -706,7 +877,9 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
   // Track job lifecycle: started jobs and completed jobs
   const startedJobs = {} // jobId -> tool part reference
   const completedJobs = new Set() // jobIds that received done/error
+  const pendingJobs = {}
   const interactiveMessages = new Map()
+  const widgetMessages = new Map()
 
   // Positional ids ("h_" + result.length) shift whenever an earlier
   // event is hidden (compact_replace ranges, branch filtering), which
@@ -915,7 +1088,9 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
       tc = findToolByJobId(jobId)
     }
     if (!tc && cur) {
-      tc = [...cur.parts].reverse().find((p) => p.type === "tool" && p.name === name)
+      tc = [...cur.parts]
+        .reverse()
+        .find((p) => p.type === "tool" && p.name === name && (!jobId || !p.jobId))
     }
     if (!tc) {
       // Search all messages as final fallback (name match, or partial match for sub-agents)
@@ -927,6 +1102,7 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
           .find(
             (p) =>
               p.type === "tool" &&
+              (!jobId || !p.jobId) &&
               (p.name === name || p.name.startsWith(name) || name.startsWith(p.name)) &&
               !p.result,
           )
@@ -1001,6 +1177,17 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
 
   for (const evt of events) {
     const t = evt.type
+    const jobId = evt.job_id || evt.call_id || ""
+    if (jobId && (t === "tool_call" || t === "subagent_call")) {
+      pendingJobs[jobId] = {
+        name: evt.name || (t === "subagent_call" ? "subagent" : "tool"),
+        type: t === "subagent_call" ? "subagent" : "tool",
+        startedAt: _evtStartedTs(evt),
+      }
+    }
+    if (jobId && (t === "tool_result" || t === "subagent_result")) {
+      completedJobs.add(jobId)
+    }
     curEventKey = evt._history_key ?? (typeof evt.event_id === "number" ? `e${evt.event_id}` : null)
 
     // Skip events on a non-selected branch of their turn (siblings of
@@ -1048,7 +1235,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
-        eventId: typeof evt.pending_id === "string" ? evt.pending_id : undefined,
+        rawContent: normalized.rawContent,
+        eventId: evt.pending_id || evt.request_id || undefined,
         timestamp: "",
         locator:
           t === "user_message" && typeof evt.event_id === "number"
@@ -1082,7 +1270,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
-        eventId: typeof evt.pending_id === "string" ? evt.pending_id : undefined,
+        rawContent: normalized.rawContent,
+        eventId: evt.pending_id || evt.request_id || undefined,
         turnIndex: typeof evt?.turn_index === "number" ? evt.turn_index : null,
         injectedMidTurn: true,
         timestamp: "",
@@ -1091,7 +1280,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
       result.push(injected)
     } else if (["ask_text", "confirm", "selection", "card"].includes(t)) {
       const uiEventId = evt.ui_event_id ?? evt.payload?.event_id
-      if (!uiEventId) continue
+      if (!uiEventId || widgetMessages.has(uiEventId) || interactiveMessages.has(uiEventId))
+        continue
       cur = null
       const message = {
         id: `ui_${uiEventId}`,
@@ -1122,6 +1312,27 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
       if (target && ["accepted", "superseded"].includes(evt.status)) {
         target.superseded = true
       }
+    } else if (t === "widget") {
+      const message = _widgetMessageFromRow(evt, tab)
+      if (!message || widgetMessages.has(message.eventId)) continue
+      const twin = interactiveMessages.get(message.eventId)
+      if (twin) {
+        twin.viaWidget = true
+        widgetMessages.set(message.eventId, twin)
+        continue
+      }
+      cur = null
+      addHistoryKey(message, evt)
+      result.push(message)
+      widgetMessages.set(message.eventId, message)
+    } else if (
+      t === "widget_update" ||
+      t === "widget_state" ||
+      t === "widget_message" ||
+      t === "widget_close"
+    ) {
+      const target = widgetMessages.get(evt.widget_id)
+      if (target) _applyWidgetRow(target, t, evt)
     } else if (t === "processing_start") {
       cur = {
         id: stableId("h_"),
@@ -1161,6 +1372,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
             role: "trigger",
             content: ch ? `channel: ${ch}${sender ? ` from ${sender}` : ""}` : evt.name,
             triggerContent: evt.content || "",
+            triggerName: evt.trigger_id || "",
+            triggerUiName: evt.ui_name || "",
             channel: ch,
             sender,
             timestamp: "",
@@ -1341,6 +1554,8 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
           role: "trigger",
           content: ch ? `channel: ${ch}${sender ? ` from ${sender}` : ""}` : "",
           triggerContent: evt.content || "",
+          triggerName: evt.trigger_id || "",
+          triggerUiName: evt.ui_name || "",
           channel: ch,
           sender,
           timestamp: "",
@@ -1435,6 +1650,7 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
         sender: evt.sender || "",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: "",
       }
       addHistoryKey(channelMessage, evt)
@@ -1560,17 +1776,12 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
 
   // Determine which jobs are still pending (started but no done/error).
   // Mark them as "running" so live WS events can update them.
-  const pendingJobs = {}
+  for (const jobId of completedJobs) delete pendingJobs[jobId]
+  for (const job of Object.values(pendingJobs)) job.startedAt ??= Date.now()
   for (const [jobId, toolPart] of Object.entries(startedJobs)) {
-    if (!completedJobs.has(jobId)) {
+    if (pendingJobs[jobId]) {
       toolPart.status = "running"
-      // Prefer the event-derived start; Date.now() only as last resort.
-      toolPart.startedAt = toolPart.startedAt || Date.now()
-      pendingJobs[jobId] = {
-        name: toolPart.name,
-        type: toolPart.kind === "subagent" ? "subagent" : "tool",
-        startedAt: toolPart.startedAt,
-      }
+      toolPart.startedAt = pendingJobs[jobId].startedAt
       if (toolPart.children) {
         for (const child of toolPart.children) {
           if (child.status === "done" && !child.result) {
@@ -1645,6 +1856,7 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
   // role=user message per (turn, branch).
   const userTurnsForResult = []
   const assistantTurnsForResult = []
+  const assistantBranchesForResult = []
   const seenUserKey = new Set()
   for (const evt of events) {
     const eid = evt?.event_id
@@ -1659,6 +1871,7 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
       userTurnsForResult.push(ti)
     } else if (evt.type === "processing_end") {
       assistantTurnsForResult.push(ti)
+      assistantBranchesForResult.push(typeof bi === "number" ? bi : null)
     }
   }
 
@@ -1715,9 +1928,11 @@ function _replayPreparedEvents(messages, prepared, tab = "") {
       }
     } else if (msg.role === "assistant") {
       const ti = assistantTurnsForResult[assistantMsgIdx]
+      const bi = assistantBranchesForResult[assistantMsgIdx]
       assistantMsgIdx += 1
       if (typeof ti === "number") {
         msg.turnIndex = ti
+        if (typeof bi === "number") msg.branchId = bi
         _attachAssistantNav(msg, ti)
       }
     }
@@ -1904,6 +2119,8 @@ const _chatStoreOptions = {
   state: () => ({
     /** @type {Object<string, import('@/utils/api').ChatMessage[]>} */
     messagesByTab: {},
+    /** @type {Record<string, Record<string, object>>} Per-tab inline ``<ui>`` block state by ``turn:branch:block`` */
+    inlineUiStateByTab: {},
     /** @type {string | null} */
     activeTab: null,
     /** @type {string[]} */
@@ -1921,6 +2138,7 @@ const _chatStoreOptions = {
      */
     processingByTab: {},
     modelRecoveryByTab: {},
+    toolArgsProgressByTab: {},
     /** @type {Object<string, {prompt: number, completion: number, total: number, cached: number}>} Per-source token usage */
     tokenUsage: {},
     /**
@@ -1951,6 +2169,8 @@ const _chatStoreOptions = {
      * @type {Object<string, Object<number, number>>}
      */
     branchViewByTab: {},
+    /** Tabs whose branchViewByTab was set by an explicit user chevron. */
+    _browsedBranchByTab: {},
     /** Per-tab branch operation state for regenerate/edit UX. */
     branchOperationByTab: {},
     /** Last branch operation error, keyed by tab. */
@@ -1998,6 +2218,8 @@ const _chatStoreOptions = {
     _jobTimer: null,
     /** @type {string | null} */
     _instanceId: null,
+    /** Saved-host identity of the current live binding; null denotes same-origin. */
+    _instanceHostId: null,
     /** Canonical graph id for the active instance. For terrarium-typed
      *  instances this is the routing key for ``terrariumAPI`` and the
      *  ``/ws/sessions/{gid}/creatures/{target}/chat`` URL. For solo
@@ -2031,8 +2253,6 @@ const _chatStoreOptions = {
     queuedMessagesByTab: {},
     /** @type {number} Monotonic token to ignore stale history/WS callbacks after instance switches */
     _instanceGeneration: 0,
-    /** @type {Record<string, number>} Recent user message signatures for cross-tab dedupe */
-    _recentUserInputs: {},
     /** @type {Record<string, {active: boolean, expectedBranchByTurn?: Record<string, number>}>} Tabs needing canonical replay after regen/edit streaming finishes */
     _branchResyncPendingByTab: {},
     /** @type {Record<string, number>} Debounce timers for post-branch history resync */
@@ -2075,6 +2295,12 @@ const _chatStoreOptions = {
      * @type {Record<string, {turnIndex: number, branchId: number} | null>}
      */
     _streamingBranchByTab: {},
+    /**
+     * Complete selected path captured at the first idle-to-processing send,
+     * held until streaming coordinates arrive.
+     * @type {Record<string, Array<[number, number]>>}
+     */
+    _pendingBranchPathByTab: {},
 
     // ── Multi-chat-panel state (Option E) ───────────────────────
     //
@@ -2177,6 +2403,16 @@ const _chatStoreOptions = {
       const target = state._streamingBranchByTab[tab]
       if (!target) return true
       const view = state.branchViewByTab[tab]
+      if (
+        !_branchMatchesViewedAncestors(
+          state.eventsByTab[tab],
+          view,
+          target.turnIndex,
+          target.branchId,
+          target.parentBranchPath,
+        )
+      )
+        return false
       // No explicit override means "latest branch" — the latest branch
       // for the streaming turn IS the streaming branch, since the
       // backend always opens a fresh max_branch+1. So an unset view
@@ -2235,6 +2471,7 @@ const _chatStoreOptions = {
   },
 
   actions: {
+    ...inlineUiActions,
     _setEvents(tab, events) {
       if (!tab) return
       this.eventsByTab[tab] = markRaw(Array.isArray(events) ? events : [])
@@ -2264,6 +2501,8 @@ const _chatStoreOptions = {
 
     initForInstance(instance, options = {}) {
       const { initialTab = null, autoReconnect = true } = options
+      const hostId = useHostsStore().activeHostId
+      const hostChanged = this._instanceHostId !== hostId
       // A solo creature that grew via group_add_node is reported by
       // the backend as ``terrarium`` after the second creature joins.
       // Without this type-change check the chat store stays in
@@ -2279,15 +2518,16 @@ const _chatStoreOptions = {
       // chatting with the original creature; defaulting to ``creatures[0]``
       // (sorted by creature_id) would yank focus to whichever creature
       // happens to sort first.
-      const willReInit = !this._ws || this._instanceId !== instance.id || typeChanged
-      const preservedActiveTab = willReInit ? this.activeTab : null
-      if (this._instanceId === instance.id && this._ws && !typeChanged) {
+      const willReInit = !this._ws || this._instanceId !== instance.id || typeChanged || hostChanged
+      const preservedActiveTab = willReInit && !hostChanged ? this.activeTab : null
+      if (this._instanceId === instance.id && this._ws && !typeChanged && !hostChanged) {
         // Already inited; just switch the active tab if a hint was
         // passed (used by the graph editor's "open chat" on inner
         // creatures so the right sub-tab pops up without a reload).
         if (initialTab && initialTab !== this.activeTab) {
           this.openTab(initialTab)
         }
+        this._adoptCreatureUsage(instance)
         // Same instance, WS already up. Nothing to do — the live WS
         // is already streaming any new events into ``messagesByTab``,
         // so re-fetching ``/history`` here would be wasted work and
@@ -2299,11 +2539,13 @@ const _chatStoreOptions = {
       this._cleanup()
       const generation = ++this._instanceGeneration
       this._instanceId = instance.id
+      this._instanceHostId = hostId
       this._instanceGraphId = instance.graph_id || instance.id
       this._instanceType = instance.type
       this._autoReconnect = autoReconnect
       this.tabs = []
       this.messagesByTab = {}
+      this.inlineUiStateByTab = {}
       this.tokenUsage = {}
       this.subagentUsageByJob = {}
       this.runningJobs = {}
@@ -2314,9 +2556,10 @@ const _chatStoreOptions = {
       this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this.modelRecoveryByTab = {}
-      this._recentUserInputs = {}
+      this.toolArgsProgressByTab = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
+      this._pendingBranchPathByTab = {}
       this.commandInventoryByTab = {}
       this.commandInventoryRevisionByTab = {}
       this._commandInventoryFetchedAtByTab = {}
@@ -2376,6 +2619,7 @@ const _chatStoreOptions = {
           this.modelByTab["root"] = { ...info }
         }
       }
+      this._adoptCreatureUsage(instance)
 
       // Reset status store too. Actions run detached from any Vue
       // setup context, so ``injectScope()`` would return null —
@@ -2648,6 +2892,7 @@ const _chatStoreOptions = {
     async prepareSlashSend(tab, content) {
       const parsed = _parseSlashCommand(content)
       if (!parsed || !tab || tab.type === "channel") return null
+      if (parsed.command === "btw") return { type: "command", name: "btw" }
       const marked = this._slashTargetByTab[tab.key]
       if (marked && marked.name.toLowerCase() === parsed.command) return marked
       const inventory = await this.loadCommandInventory(tab)
@@ -2687,11 +2932,11 @@ const _chatStoreOptions = {
           slashCommand.command === "goal" &&
           (!target ||
             (target.type === "command" && target.name.toLowerCase() === slashCommand.command))
-        if (isGoal) {
+        if (isGoal || slashCommand.command === "btw") {
           const result = await terrariumAPI.executeCreatureCommand(
             this._instanceGraphId || this._instanceId,
             tabInfo?.creature || tab,
-            "goal",
+            slashCommand.command,
             slashCommand.args,
           )
           this.invalidateCommandInventory(tab)
@@ -2705,7 +2950,6 @@ const _chatStoreOptions = {
       const now = Date.now()
       const contentParts = typeof text === "string" ? [{ type: "text", text }] : text
       const normalized = normalizeMessageContent(contentParts)
-      const signature = contentSignature(contentParts)
       // Client-minted stable id so a message that gets buffered mid-turn
       // can be edited / cancelled by id (UXI-08a). The backend echoes it
       // as the pending id; the ``input_queued`` ack confirms the slot.
@@ -2715,11 +2959,12 @@ const _chatStoreOptions = {
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         eventId,
+        _inputEchoPending: true,
         timestamp: new Date(now).toISOString(),
       }
 
-      this._recentUserInputs[`${tab}:${signature}`] = now
       if (this.processingByTab[tab]) {
         // Don't put in main chat — hold in this tab's queue, shown
         // above the input box. The queue is per-tab so a busy stream
@@ -2741,9 +2986,12 @@ const _chatStoreOptions = {
         }
       } else {
         const target = tab
-        this._ws.send(
-          JSON.stringify({ type: "input", target, content: contentParts, event_id: eventId }),
-        )
+        const payload = { type: "input", target, content: contentParts, event_id: eventId }
+        const branchView = this.branchViewByTab[tab]
+        if (this._browsedBranchByTab[tab] && branchView && Object.keys(branchView).length)
+          payload.branch_view = { ...branchView }
+        this._ws.send(JSON.stringify(payload))
+        this._capturePendingBranchPath(target, payload.branch_view)
         // Flip processing optimistically — the backend's
         // processing_start event will confirm it; this ensures the
         // indicator and interrupt button appear immediately on the
@@ -2839,6 +3087,10 @@ const _chatStoreOptions = {
         if (generation !== this._instanceGeneration || ws !== this._ws) return
         this.wsStatus = "open"
         this._reconnectDelay = 500
+        this._sendClientHello()
+        if (!this._helloWatchStop) {
+          this._helloWatchStop = markRaw(watchHelloRenderers(() => this._sendClientHello()))
+        }
         onOpen?.()
       }
       ws.onmessage = (event) => {
@@ -2861,6 +3113,7 @@ const _chatStoreOptions = {
         const wasOpen = this.wsStatus === "open"
         this.wsStatus = "reconnecting"
         this.modelRecoveryByTab = {}
+        this.toolArgsProgressByTab = {}
         for (const tab of Object.keys(this.branchOperationByTab)) {
           this._failBranchOperation(tab, "Connection closed before the operation completed.")
         }
@@ -2880,7 +3133,12 @@ const _chatStoreOptions = {
         this._reconnectDelay = Math.min(delay * 2, 10000)
         this._reconnectTimer = setTimeout(() => {
           this._reconnectTimer = null
-          if (generation !== this._instanceGeneration) return
+          if (generation !== this._instanceGeneration || ws !== this._ws) return
+          if (this._instanceHostId !== useHostsStore().activeHostId) {
+            this._ws = null
+            this.wsStatus = "closed"
+            return
+          }
           reconnect()
         }, delay)
       }
@@ -2943,9 +3201,13 @@ const _chatStoreOptions = {
      * Pure branch-switch rebuilds pass ``fetchedAt = null`` and never
      * remove.
      */
-    _reconcileRunningJobs(tab, pendingJobs, fetchedAt = null) {
-      const pendingIds = new Set(Object.keys(pendingJobs))
+    _reconcileRunningJobs(tab, pendingJobs, fetchedAt = null, liveJobIds = null) {
+      const liveIds = Array.isArray(liveJobIds) ? new Set(liveJobIds) : null
+      const pendingIds = new Set(
+        Object.keys(pendingJobs).filter((id) => !liveIds || liveIds.has(id)),
+      )
       for (const [jobId, job] of Object.entries(pendingJobs)) {
+        if (!pendingIds.has(jobId)) continue
         const existing = this.runningJobs[jobId]
         // Keep the earliest known start — a live entry pre-dates any
         // rebuild approximation and must not be pushed forward.
@@ -2964,15 +3226,25 @@ const _chatStoreOptions = {
           startedAt,
         }
       }
+      for (const jobId of liveIds || []) {
+        if (!this.runningJobs[jobId]) {
+          this.runningJobs[jobId] = {
+            name: jobId,
+            tab,
+            startedAt: fetchedAt ?? Date.now(),
+            promotable: false,
+          }
+        }
+      }
       if (fetchedAt != null) {
         for (const [jobId, job] of Object.entries(this.runningJobs)) {
           if (job.tab !== tab) continue
-          if (pendingIds.has(jobId)) continue
+          if ((liveIds || pendingIds).has(jobId)) continue
           if (job.startedAt == null || job.startedAt >= fetchedAt) continue
           delete this.runningJobs[jobId]
         }
       }
-      if (pendingIds.size > 0) this._ensureJobTimer()
+      if (pendingIds.size > 0 || liveIds?.size > 0) this._ensureJobTimer()
       this._checkJobTimer()
     },
 
@@ -3002,19 +3274,23 @@ const _chatStoreOptions = {
       }
     },
 
-    /** Restore token usage from event log (for page refresh) */
+    /** Restore token usage from event log (for page refresh). Totals of a
+     *  source that already holds backend-reported usage are left alone —
+     *  a history window is only a fallback for viewers without a backend
+     *  baseline (saved sessions, older servers); sub-agent snapshots are
+     *  always folded in. */
     _restoreTokenUsage(source, events, alreadyDeduped = false) {
-      // Canonical history is authoritative — rebuild this source's total
-      // from scratch so a reconnect (which re-runs _loadHistory on the
-      // same generation) does not add the persisted token_usage rows a
-      // second time and double the count.
-      this.tokenUsage[source] = { prompt: 0, completion: 0, total: 0, cached: 0, lastPrompt: 0 }
+      const backendOwned = !!this.tokenUsage[source]?.backend
+      // Rebuilt from zero so a reconnect replay does not count rows twice.
+      if (!backendOwned) {
+        this.tokenUsage[source] = { prompt: 0, completion: 0, total: 0, cached: 0, lastPrompt: 0 }
+      }
       const normalizedEvents = alreadyDeduped ? events : _dedupeAdjacentDuplicateEvents(events)
       for (const evt of normalizedEvents) {
         const isTokenEvt =
           (evt.type === "activity" && evt.activity_type === "token_usage") ||
           evt.type === "token_usage"
-        if (isTokenEvt) {
+        if (isTokenEvt && !backendOwned) {
           const prev = this.tokenUsage[source]
           this.tokenUsage[source] = {
             prompt: prev.prompt + (evt.prompt_tokens || 0),
@@ -3030,6 +3306,36 @@ const _chatStoreOptions = {
         if (evt.type === "subagent_token_usage" || evt.type === "subagent_result") {
           this._recordSubagentUsage(source, evt.job_id, evt)
         }
+      }
+    },
+
+    /** Replace ``tab``'s usage with backend-reported running totals
+     *  (``{prompt, completion, cached, total}``) and context fill. */
+    _applyCreatureUsage(tab, usage, contextTokens) {
+      if (!tab || !usage || typeof usage !== "object") return
+      const prompt = Number(usage.prompt) || 0
+      const completion = Number(usage.completion) || 0
+      this.tokenUsage[tab] = {
+        prompt,
+        completion,
+        cached: Number(usage.cached) || 0,
+        total: Number(usage.total) || prompt + completion,
+        lastPrompt: Number(contextTokens) || 0,
+        backend: true,
+      }
+    },
+
+    /** Adopt each creature's ``token_usage`` / ``context_tokens`` from an
+     *  instance snapshot. Totals only grow, so a snapshot older than the
+     *  live frames already applied (smaller total) is skipped. */
+    _adoptCreatureUsage(instance) {
+      for (const c of instance?.creatures || []) {
+        if (!c?.name || !c.token_usage || typeof c.token_usage !== "object") continue
+        const key = this._rootSourceName && c.name === this._rootSourceName ? "root" : c.name
+        const current = this.tokenUsage[key]
+        const incoming = Number(c.token_usage.total) || 0
+        if (current?.backend && incoming < (current.total || 0)) continue
+        this._applyCreatureUsage(key, c.token_usage, c.context_tokens)
       }
     },
 
@@ -3058,11 +3364,42 @@ const _chatStoreOptions = {
       const source = this._tabForSource(data.source || "")
       if (source) this._updateModelRecovery(source, data)
       if (data.type === "model_recovery") return
+      if (data.type === "tool_args_progress") {
+        if (source) this._updateToolArgsProgress(source, data)
+        return
+      }
+      if (source && this.toolArgsProgressByTab[source] && endsToolArgsProgress(data)) {
+        delete this.toolArgsProgressByTab[source]
+      }
+      const runningKey =
+        source && data.type === "activity" ? this._trackRunningJob(source, data) : null
       if (source) {
         if (
-          ["ask_text", "confirm", "selection", "card", "ui_supersede", "ui_reply_ack"].includes(
-            data.type,
-          )
+          [
+            "ask_text",
+            "confirm",
+            "selection",
+            "card",
+            "ui_supersede",
+            "ui_reply_ack",
+            "widget",
+            "widget_close",
+            "widget_ack",
+            "processing_start",
+            "processing_end",
+            "processing_error",
+            "idle",
+          ].includes(data.type) ||
+          (data.type === "activity" &&
+            [
+              "processing_error",
+              "tool_start",
+              "tool_done",
+              "tool_error",
+              "subagent_start",
+              "subagent_done",
+              "subagent_error",
+            ].includes(data.activity_type))
         ) {
           this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
         }
@@ -3087,8 +3424,19 @@ const _chatStoreOptions = {
             summary: _attentionEdgeSummary(data, this._attentionStreamTextByTab[source]),
           },
         )
+        if (!data.replay && !data.history) {
+          const hasJobs = Object.values(this.runningJobs).some((job) => job.tab === source)
+          if (hasJobs) state.background = true
+          else if (
+            data.type === "activity" &&
+            ["tool_done", "tool_error", "subagent_done", "subagent_error"].includes(
+              data.activity_type,
+            )
+          )
+            state.background = false
+        }
         this.attentionByTab[source] = state
-        publishAttention(scope, source, state)
+        publishAttention(scope, source, state, data)
       }
 
       if (data.type === "user_input") {
@@ -3137,7 +3485,7 @@ const _chatStoreOptions = {
         this._finishStream(source)
         this._scheduleBranchResync(source)
       } else if (data.type === "activity") {
-        this._handleActivity(source, data)
+        this._handleActivity(source, data, runningKey)
       } else if (data.type === "image") {
         this._handleAssistantImage(source, data)
       } else if (data.type === "channel_message") {
@@ -3155,6 +3503,16 @@ const _chatStoreOptions = {
         this._handleUISupersede(source, data)
       } else if (data.type === "ui_reply_ack") {
         this._handleUIReplyAck(source, data)
+      } else if (data.type === "widget") {
+        this._handleWidget(source, data)
+      } else if (data.type === "widget_close") {
+        this._handleWidgetClose(source, data)
+      } else if (data.type === "widget_state") {
+        this._handleWidgetState(source, data)
+      } else if (data.type === "inline_ui_state") {
+        this._handleInlineUiState(source, data)
+      } else if (data.type === "widget_ack") {
+        this._handleWidgetAck(source, data)
       } else if (data.type === "input_queued") {
         this._handlePendingAck(source, data, "queued")
       } else if (data.type === "input_edit_ack") {
@@ -3171,6 +3529,7 @@ const _chatStoreOptions = {
         if (source) {
           this.processingByTab[source] = false
           this._failBranchOperation(source, data.content || "Branch operation failed")
+          delete this._pendingBranchPathByTab[source]
         }
       }
     },
@@ -3270,6 +3629,152 @@ const _chatStoreOptions = {
       }
     },
 
+    _findWidgetMessage(tab, eventId) {
+      const list = this.messagesByTab[tab] || []
+      return (
+        list.find((m) => (m.role === "widget" || m.role === "ui_event") && m.eventId === eventId) ||
+        null
+      )
+    },
+
+    /** A ``widget`` frame: a new widget, or a patch when it has ``update_target``. */
+    _handleWidget(source, data) {
+      const tab = source || ""
+      const payload = data.payload || {}
+      if (data.update_target) {
+        const existing = this._findWidgetMessage(tab, data.update_target)
+        if (existing) {
+          _applyWidgetPatch(existing, payload)
+          return
+        }
+        if (!payload.renderer) return
+      }
+      const eventId = data.update_target || data.event_id
+      if (!eventId || this._findWidgetMessage(tab, eventId)) return
+      const kind = legacyKindOf(payload.renderer)
+      if (kind) {
+        if (kind === "notification" && data.surface === "toast") {
+          this._handleUIEvent(source, {
+            type: kind,
+            event_id: eventId,
+            surface: "toast",
+            payload: payload.spec || {},
+          })
+          return
+        }
+        this._addMsg(
+          tab,
+          _legacyWidgetMessage(tab, eventId, kind, payload.spec || {}, {
+            interactive: !!data.interactive,
+            surface: data.surface || "chat",
+            timestamp: new Date().toISOString(),
+          }),
+        )
+        return
+      }
+      this._addMsg(
+        tab,
+        _genericWidgetMessage(tab, eventId, {
+          ...payload,
+          interactive: !!data.interactive,
+          surface: data.surface || "chat",
+        }),
+      )
+    },
+
+    _handleWidgetClose(source, data) {
+      const target = this._findWidgetMessage(source || "", data.event_id)
+      if (target) _closeWidgetMessage(target, data.payload?.reason || data.reason || "")
+    },
+
+    _handleWidgetState(source, data) {
+      const target = this._findWidgetMessage(source || "", data.event_id)
+      if (target?.role === "widget" && data.state && typeof data.state === "object") {
+        target.state = { ...data.state }
+      }
+    },
+
+    /** ``widget_ack``: legacy kinds map like ``ui_reply_ack``; generic widgets keep the last ack. */
+    _handleWidgetAck(source, data) {
+      const target = this._findWidgetMessage(source || "", data.event_id)
+      if (!target) return
+      const kind = data.kind || "message"
+      if (target.role === "widget") {
+        target.lastAck = { kind, status: data.status || "" }
+        return
+      }
+      if (kind !== "message") return
+      switch (data.status) {
+        case "accepted":
+          target.replied = true
+          break
+        case "superseded":
+          if (!target.replied) target.superseded = true
+          break
+        case "unknown":
+          target.replied = false
+          target.timedOut = true
+          break
+        case "dropped":
+        case "rate_limited":
+          target.replied = false
+          target.repliedActionId = ""
+          target.repliedValues = null
+          break
+      }
+    },
+
+    _sendWidgetFrame(frame) {
+      if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return false
+      try {
+        this._ws.send(JSON.stringify({ ...frame, ts: Date.now() / 1000 }))
+        return true
+      } catch (err) {
+        console.error(`${frame.type} failed:`, err)
+        return false
+      }
+    },
+
+    /** Send one widget message (``widget_msg``) for the widget ``eventId`` in ``tab``. */
+    submitWidgetMessage(tab, eventId, name, data = {}, origin = "renderer") {
+      return this._sendWidgetFrame({
+        type: "widget_msg",
+        target: tab,
+        event_id: eventId,
+        name,
+        data: data || {},
+        origin: origin === "app" ? "app" : "renderer",
+      })
+    },
+
+    /** Merge ``patch`` into a widget's state now and send it, debounced per widget. */
+    setWidgetState(tab, eventId, patch) {
+      if (!patch || typeof patch !== "object") return
+      const target = this._findWidgetMessage(tab, eventId)
+      if (target?.role === "widget") target.state = { ...target.state, ...patch }
+      if (!this._widgetStateTimers) this._widgetStateTimers = markRaw(new Map())
+      const timers = this._widgetStateTimers
+      const key = `${tab}|${eventId}`
+      const pending = timers.get(key)
+      if (pending) clearTimeout(pending.timer)
+      const state = { ...(pending?.state || {}), ...patch }
+      const timer = setTimeout(() => {
+        timers.delete(key)
+        this._sendWidgetFrame({ type: "widget_state", target: tab, event_id: eventId, state })
+      }, WIDGET_STATE_DEBOUNCE_MS)
+      timers.set(key, { timer, state })
+    },
+
+    /** Announce this client's widget renderers on the current socket. */
+    _sendClientHello() {
+      ensureBuiltinWidgetRenderers()
+      return this._sendWidgetFrame({
+        type: "client_hello",
+        protocol: 1,
+        renderers: helloRenderers(),
+      })
+    },
+
     /**
      * Phase B: send a UIReply over the chat WS.
      *
@@ -3281,6 +3786,13 @@ const _chatStoreOptions = {
       if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return false
       const list = this.messagesByTab[tab] || []
       const target = list.find((m) => m.role === "ui_event" && m.eventId === eventId)
+      if (target?.viaWidget) {
+        if (!this.submitWidgetMessage(tab, eventId, actionId, values || {})) return false
+        target.replied = true
+        target.repliedActionId = actionId
+        target.repliedValues = values || null
+        return true
+      }
       try {
         this._ws.send(
           JSON.stringify({
@@ -3324,8 +3836,7 @@ const _chatStoreOptions = {
       const contentParts =
         typeof newContent === "string" ? [{ type: "text", text: newContent }] : newContent
       const normalized = normalizeMessageContent(contentParts)
-      msg.content = normalized.content
-      msg.contentParts = normalized.contentParts
+      Object.assign(msg, normalized)
       if (this._ws?.readyState === WebSocket.OPEN) {
         this._ws.send(
           JSON.stringify({
@@ -3379,7 +3890,52 @@ const _chatStoreOptions = {
       queue.splice(idx, 1)
     },
 
-    _handleActivity(source, data) {
+    _trackRunningJob(source, data) {
+      if (data.replay || data.history) return null
+      const at = data.activity_type
+      if (at === "tool_start" || at === "subagent_start") {
+        let key = data.job_id || data.id || "tc_" + Date.now()
+        if (!data.job_id && !data.id) {
+          while (this.runningJobs[key]) key += "_"
+        }
+        this.runningJobs[key] = {
+          name: data.name || "unknown",
+          type: at === "subagent_start" ? "subagent" : "tool",
+          startedAt: this.runningJobs[key]?.startedAt ?? Date.now(),
+          promotable: !data.background,
+          tab: source,
+        }
+        this._ensureJobTimer()
+        this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+        return key
+      }
+      if (
+        ["tool_done", "tool_error", "subagent_done", "subagent_error", "task_promoted"].includes(at)
+      ) {
+        const key =
+          data.job_id ||
+          (this.runningJobs[data.id]?.tab === source ? data.id : null) ||
+          Object.entries(this.runningJobs)
+            .reverse()
+            .find(
+              ([, job]) =>
+                job.tab === source &&
+                job.name === (data.name || "unknown") &&
+                job.type === (at.startsWith("subagent_") ? "subagent" : "tool"),
+            )?.[0]
+        const job = this.runningJobs[key]
+        if (job?.tab === source) {
+          if (at === "task_promoted") job.promotable = false
+          else delete this.runningJobs[key]
+        }
+        this._checkJobTimer()
+        this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+        return key || ""
+      }
+      return null
+    },
+
+    _handleActivity(source, data, runningKey = this._trackRunningJob(source, data)) {
       const at = data.activity_type
       const name = data.name || "unknown"
 
@@ -3388,6 +3944,14 @@ const _chatStoreOptions = {
       // so recover scope from this store's $id and pass it through.
       const statusStore = useStatusStore(scopeOfStoreId(this.$id))
       statusStore.handleActivity(data)
+
+      if (
+        (at === "compact_complete" || at === "context_cleared") &&
+        typeof data.context_tokens === "number" &&
+        this.tokenUsage[source]
+      ) {
+        this.tokenUsage[source] = { ...this.tokenUsage[source], lastPrompt: data.context_tokens }
+      }
 
       if (at === "assistant_reasoning") {
         const tab = source || data.agent_name || this.activeTab
@@ -3430,6 +3994,9 @@ const _chatStoreOptions = {
         if (data.max_context != null) info.maxContext = data.max_context
         if (data.compact_threshold != null) info.compactThreshold = data.compact_threshold
         const tab = source || data.agent_name || ""
+        if (tab && data.branch_view) this._adoptAuthoritativeBranchView(tab, data.branch_view)
+        if (tab && data.token_usage)
+          this._applyCreatureUsage(tab, data.token_usage, data.context_tokens)
         if (tab && Object.keys(info).length) {
           this.modelByTab[tab] = { ...(this.modelByTab[tab] || {}), ...info }
           if (tab === this._rootSourceName && this.tabs.includes("root")) {
@@ -3454,20 +4021,27 @@ const _chatStoreOptions = {
       }
 
       if (at === "token_usage") {
-        const prev = this.tokenUsage[source] || {
-          prompt: 0,
-          completion: 0,
-          total: 0,
-          cached: 0,
-          lastPrompt: 0,
-        }
-        this.tokenUsage[source] = {
-          ...(prev.partial ? { partial: true } : {}),
-          prompt: prev.prompt + (data.prompt_tokens || 0),
-          completion: prev.completion + (data.completion_tokens || 0),
-          total: prev.total + (data.total_tokens || 0),
-          cached: prev.cached + (data.cached_tokens || 0),
-          lastPrompt: data.prompt_tokens || prev.lastPrompt,
+        if (data.totals) {
+          this._applyCreatureUsage(source, data.totals, data.context_tokens ?? data.prompt_tokens)
+        } else {
+          // Servers without running totals: add deltas; a source with no
+          // history baseline yet stays partial so its history load rebuilds it.
+          const prev = this.tokenUsage[source] || {
+            prompt: 0,
+            completion: 0,
+            total: 0,
+            cached: 0,
+            lastPrompt: 0,
+            partial: true,
+          }
+          this.tokenUsage[source] = {
+            ...(prev.partial ? { partial: true } : {}),
+            prompt: prev.prompt + (data.prompt_tokens || 0),
+            completion: prev.completion + (data.completion_tokens || 0),
+            total: prev.total + (data.total_tokens || 0),
+            cached: prev.cached + (data.cached_tokens || 0),
+            lastPrompt: data.prompt_tokens || prev.lastPrompt,
+          }
         }
         const list = this.messagesByTab[source] || []
         const target = [...list].reverse().find((message) => message?.role === "assistant")
@@ -3500,7 +4074,6 @@ const _chatStoreOptions = {
         return
       }
 
-      // Ensure we have a tab for this source
       if (!this.messagesByTab[source]) return
       // Branch isolation — every remaining activity below mutates the
       // displayed message list. If this frame is for a branch the user
@@ -3516,7 +4089,9 @@ const _chatStoreOptions = {
       // snapshotted before this frame cannot clobber the fresher live
       // state when it resolves (e.g. a tool_done landing during the
       // fetch must not be reverted to "running" by the stale replay).
-      this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+      if (runningKey === null) {
+        this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+      }
 
       if (at === "wire_inbound") {
         // Output-wiring delivery from another creature. The fields
@@ -3660,6 +4235,8 @@ const _chatStoreOptions = {
           role: "trigger",
           content: `${label}${from}`,
           triggerContent: data.content || "",
+          triggerName: data.trigger_id || "",
+          triggerUiName: data.ui_name || "",
           channel,
           sender,
           timestamp: new Date().toISOString(),
@@ -3678,7 +4255,7 @@ const _chatStoreOptions = {
           const tail = last.parts[last.parts.length - 1]
           if (tail.type === "text") tail._streaming = false
         }
-        const toolId = data.id || "tc_" + Date.now()
+        const toolId = data.id || runningKey || "tc_" + Date.now()
         const jobId = data.job_id || ""
         const startedPart = {
           type: "tool",
@@ -3697,17 +4274,6 @@ const _chatStoreOptions = {
         }
         last.parts.push(startedPart)
         this._indexToolPart(source, startedPart, msgs)
-        // Track all tasks as running jobs (direct tasks are promotable)
-        const runKey = jobId || toolId
-        const isBg = data.background || false
-        this.runningJobs[runKey] = {
-          name,
-          type: at === "subagent_start" ? "subagent" : "tool",
-          startedAt: Date.now(),
-          promotable: !isBg,
-          tab: source,
-        }
-        this._ensureJobTimer()
       } else if (at === "tool_done" || at === "subagent_done") {
         let tc = this._findToolPart(source, msgs, name, data.job_id)
         if (!tc) {
@@ -3743,8 +4309,6 @@ const _chatStoreOptions = {
         if (data.prompt_tokens != null) tc.prompt_tokens = data.prompt_tokens
         if (data.completion_tokens != null) tc.completion_tokens = data.completion_tokens
         if (at === "subagent_done") this._recordSubagentUsage(source, data.job_id, data)
-        delete this.runningJobs[tc.jobId || tc.id]
-        this._checkJobTimer()
       } else if (at === "tool_error" || at === "subagent_error") {
         let tc = this._findToolPart(source, msgs, name, data.job_id)
         if (!tc) {
@@ -3780,8 +4344,6 @@ const _chatStoreOptions = {
         if (data.prompt_tokens != null) tc.prompt_tokens = data.prompt_tokens
         if (data.completion_tokens != null) tc.completion_tokens = data.completion_tokens
         if (at === "subagent_error") this._recordSubagentUsage(source, data.job_id, data)
-        delete this.runningJobs[tc.jobId || tc.id]
-        this._checkJobTimer()
       } else if (at === "subagent_token_update") {
         // Live token usage update from a running sub-agent
         const saName = data.subagent || ""
@@ -3830,12 +4392,6 @@ const _chatStoreOptions = {
               child.result = data.detail || ""
             }
           }
-        }
-      } else if (at === "task_promoted") {
-        // Task promoted to background — mark as no longer promotable
-        const promJobId = data.job_id || ""
-        if (promJobId && this.runningJobs[promJobId]) {
-          this.runningJobs[promJobId].promotable = false
         }
       }
     },
@@ -3997,6 +4553,7 @@ const _chatStoreOptions = {
       }
       this.processingByTab[tab] = false
       delete this._branchResyncPendingByTab[tab]
+      delete this._pendingBranchPathByTab[tab]
       this._rebuildMessages(tab)
     },
 
@@ -4043,6 +4600,13 @@ const _chatStoreOptions = {
       const ft = data?.turn_index
       if (typeof fb !== "number" || typeof ft !== "number") return true
       const view = this.branchViewByTab[tab]
+      const streaming = this._streamingBranchByTab[tab]
+      const fallbackPath =
+        streaming?.turnIndex === ft && streaming?.branchId === fb
+          ? streaming.parentBranchPath
+          : null
+      if (!_branchMatchesViewedAncestors(this.eventsByTab[tab], view, ft, fb, fallbackPath))
+        return false
       if (view && Object.prototype.hasOwnProperty.call(view, ft)) {
         return view[ft] === fb
       }
@@ -4051,7 +4615,6 @@ const _chatStoreOptions = {
       // latest branch of its turn (the backend opens max+1 before
       // emitting any chunk), so an unset view aligns with "viewing
       // the running branch".
-      const streaming = this._streamingBranchByTab[tab]
       if (streaming && streaming.turnIndex === ft) {
         return streaming.branchId === fb
       }
@@ -4079,9 +4642,26 @@ const _chatStoreOptions = {
       if (next.phase) {
         this.processingByTab[tab] = true
         if (typeof next.turn_index === "number" && typeof next.branch_id === "number") {
-          this._streamingBranchByTab[tab] = { turnIndex: next.turn_index, branchId: next.branch_id }
+          this._promoteStreamingTarget(tab, next.turn_index, next.branch_id)
         }
       }
+    },
+
+    _updateToolArgsProgress(tab, frame) {
+      const chars = Number(frame.chars)
+      if (typeof frame.name !== "string" || !frame.name || !Number.isFinite(chars)) return
+      this.toolArgsProgressByTab[tab] = {
+        name: frame.name,
+        chars,
+        turn_index: frame.turn_index,
+        branch_id: frame.branch_id,
+      }
+    },
+
+    /** ``{name, chars}`` of the tool call whose arguments are streaming in ``tab``, or null. */
+    toolArgsProgressForTab(tab) {
+      const state = this.toolArgsProgressByTab[tab]
+      return state && this._frameMatchesViewedBranch(tab, state) ? state : null
     },
 
     modelRecoveryForTab(tab) {
@@ -4104,7 +4684,7 @@ const _chatStoreOptions = {
      * branch metadata were missing (callers can still proceed; the
      * navigator will catch up on resync).
      */
-    _injectOptimisticBranch(tab, { turnIndex, branchId, content }) {
+    _injectOptimisticBranch(tab, { turnIndex, branchId, content, requestId }) {
       if (!tab || typeof turnIndex !== "number" || typeof branchId !== "number") {
         return false
       }
@@ -4137,6 +4717,7 @@ const _chatStoreOptions = {
       const userInput = {
         type: "user_input",
         content,
+        request_id: requestId,
         event_id: baseId,
         turn_index: turnIndex,
         branch_id: branchId,
@@ -4146,6 +4727,7 @@ const _chatStoreOptions = {
       const userMessage = {
         type: "user_message",
         content,
+        request_id: requestId,
         event_id: baseId - 1,
         turn_index: turnIndex,
         branch_id: branchId,
@@ -4259,10 +4841,61 @@ const _chatStoreOptions = {
         expectedBranchByTurn[turnIndex] = branchId
         this._branchResyncPendingByTab[tab] = { ...pending, expectedBranchByTurn }
       }
-      this._streamingBranchByTab[tab] = { turnIndex, branchId }
+      this._promoteStreamingTarget(tab, turnIndex, branchId)
       if (operation)
         this.branchOperationByTab[tab] = { ...operation, phase: "accepted", turnIndex, branchId }
       return true
+    },
+
+    /** Snapshot the complete selected path for the first idle-to-processing send. */
+    _capturePendingBranchPath(tab, view = null) {
+      if (!tab || this.processingByTab[tab]) return
+      const events = this.eventsByTab[tab] || []
+      const parentPaths = _indexParentPaths(events)
+      const knownTurns = new Set(events.map((event) => event.turn_index))
+      const project = (selectedView) =>
+        _resolveSelectedBranches(
+          [
+            ...events,
+            ...Object.entries(selectedView)
+              .filter(([turn]) => !knownTurns.has(Number(turn)))
+              .map(([turn, branch]) => ({ turn_index: Number(turn), branch_id: branch })),
+          ],
+          parentPaths,
+          selectedView,
+        )
+      const selectedView = { ...(view || this.branchViewByTab[tab]) }
+      const selected = project(selectedView)
+      const anchor = [...selected]
+        .reverse()
+        .map(([turn, branch]) =>
+          events.find((event) => event.turn_index === turn && event.branch_id === branch),
+        )
+        .find(Boolean)
+      const path = parentPaths.get(anchor?.event_id) || _coercePath(anchor?.parent_branch_path)
+      for (const [turn, branch] of path) {
+        if (!selected.has(turn)) selectedView[turn] = branch
+      }
+      this._pendingBranchPathByTab[tab] = [...project(selectedView)]
+    },
+
+    /** Transfer captured send ancestry onto the live streaming target. */
+    _promoteStreamingTarget(tab, turnIndex, branchId) {
+      if (!tab || typeof turnIndex !== "number" || typeof branchId !== "number") return
+      const streaming = this._streamingBranchByTab[tab]
+      const pending = this._pendingBranchPathByTab[tab]
+      if (streaming?.turnIndex === turnIndex && streaming?.branchId === branchId) {
+        if (!streaming.parentBranchPath && pending) {
+          streaming.parentBranchPath = pending.filter(([turn]) => turn > 0 && turn < turnIndex)
+        }
+      } else {
+        const next = { turnIndex, branchId }
+        if (pending) {
+          next.parentBranchPath = pending.filter(([turn]) => turn > 0 && turn < turnIndex)
+        }
+        this._streamingBranchByTab[tab] = next
+      }
+      if (pending) delete this._pendingBranchPathByTab[tab]
     },
 
     _conversationUserPosition(tab, messageIdx) {
@@ -4375,11 +5008,13 @@ const _chatStoreOptions = {
       const predictedBranch = typeof knownLatestBranch === "number" ? knownLatestBranch + 1 : null
       let optimisticApplied = false
       if (typeof resolvedTurnIndex === "number" && predictedBranch != null) {
-        const originalContent = targetUserMsg?.contentParts || targetUserMsg?.content || ""
+        const originalContent =
+          targetUserMsg?.rawContent ?? targetUserMsg?.contentParts ?? targetUserMsg?.content ?? ""
         const injected = this._injectOptimisticBranch(tab, {
           turnIndex: resolvedTurnIndex,
           branchId: predictedBranch,
           content: originalContent,
+          requestId: owner.requestId,
         })
         if (injected) {
           if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
@@ -4488,7 +5123,16 @@ const _chatStoreOptions = {
           this._scheduleBranchResync(tab)
         }
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
-        return this._branchOperationResult(true, tab, this.branchOperationByTab[tab])
+        if (regenResponse?.execution_error) {
+          this.processingByTab[tab] = false
+          this._failBranchOperation(tab, regenResponse.execution_error)
+        }
+        return this._branchOperationResult(
+          true,
+          tab,
+          this.branchOperationByTab[tab],
+          regenResponse?.execution_error || null,
+        )
       } catch (e) {
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
         console.warn("Failed to regenerate:", e)
@@ -4593,8 +5237,10 @@ const _chatStoreOptions = {
         const normalized = normalizeMessageContent(newContent)
         const editedRow = {
           ...original,
+          eventId: owner.requestId,
           content: normalized.content,
           contentParts: normalized.contentParts,
+          rawContent: normalized.rawContent,
         }
         msgs.splice(messageIdx, msgs.length - messageIdx, editedRow)
         if (tab) this._rebuildMessageIndexes(tab)
@@ -4604,6 +5250,7 @@ const _chatStoreOptions = {
           turnIndex,
           branchId: predictedBranch,
           content: newContent,
+          requestId: owner.requestId,
         })
         if (injected) {
           if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
@@ -4709,7 +5356,16 @@ const _chatStoreOptions = {
           this._scheduleBranchResync(tab)
         }
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
-        return this._branchOperationResult(true, tab, this.branchOperationByTab[tab])
+        if (editResponse?.execution_error) {
+          this.processingByTab[tab] = false
+          this._failBranchOperation(tab, editResponse.execution_error)
+        }
+        return this._branchOperationResult(
+          true,
+          tab,
+          this.branchOperationByTab[tab],
+          editResponse?.execution_error || null,
+        )
       } catch (e) {
         if (!this._branchOpOwned(owner)) return this._branchOpSuperseded(tab)
         console.warn("Failed to edit message:", e)
@@ -4793,7 +5449,10 @@ const _chatStoreOptions = {
      *     right value.
      */
     async _resyncHistory(tab = this.activeTab, options = {}) {
-      if (!this._instanceId || !tab) return false
+      const hostId = this._instanceHostId
+      const hostCurrent = () =>
+        hostId === this._instanceHostId && hostId === useHostsStore().activeHostId
+      if (!this._instanceId || !tab || !hostCurrent()) return false
       const branchOwned = () => !options.branchOwner || this._branchOpOwned(options.branchOwner)
       if (!branchOwned()) return false
       // Per-tab request sequence. Two resyncs for the same tab can be in
@@ -4809,6 +5468,7 @@ const _chatStoreOptions = {
       const mutationGeneration = this._historyMutationSeqByTab[tab] || 0
       const requestedInstanceId = this._instanceId
       const canApply = () =>
+        hostCurrent() &&
         branchOwned() &&
         requestId === this._historyRequestSeqByTab[tab] &&
         this._instanceId === requestedInstanceId &&
@@ -4817,7 +5477,7 @@ const _chatStoreOptions = {
       const preFetchMessages = options.initialLoad ? this.messagesByTab[tab] || [] : null
       try {
         const { terrariumAPI } = await import("@/utils/api")
-        if (!branchOwned()) return false
+        if (!branchOwned() || !hostCurrent()) return false
         // Capture BEFORE the fetch: a tab-owned job that starts while
         // this request is in flight is newer than the history it
         // returns, so job-reconciliation must not prune it.
@@ -4863,6 +5523,8 @@ const _chatStoreOptions = {
             )
           }
           if (data?.is_processing) this.processingByTab[tab] = true
+          if (typeof data?.is_processing === "boolean")
+            this._publishWorkSnapshot(tab, data.is_processing)
           if (this.tokenUsage[tab]) this.tokenUsage[tab].partial = false
           return true
         }
@@ -4885,6 +5547,8 @@ const _chatStoreOptions = {
             ),
           )
           if (data?.is_processing) this.processingByTab[tab] = true
+          if (typeof data?.is_processing === "boolean")
+            this._publishWorkSnapshot(tab, data.is_processing)
           if (this.tokenUsage[tab]) this.tokenUsage[tab].partial = false
           return true
         }
@@ -4939,9 +5603,11 @@ const _chatStoreOptions = {
         // wiping ``branchViewByTab`` here was the historical source of
         // "I switched to branch 1 of turn 2, did an unrelated action,
         // and was yanked back to the latest branch."
+        this._adoptAuthoritativeBranchView(tab, data.branch_view)
         if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
         const prepared = _prepareReplayEvents(data.events, this.branchViewByTab[tab])
         this._setEvents(tab, prepared.events)
+        this._adoptInlineUiStates(tab, prepared.events)
         this._restoreTokenUsage(tab, prepared.events, true)
         if (this.tokenUsage[tab]) this.tokenUsage[tab].partial = false
         this._rebuildMessages(tab, fetchedAt, prepared)
@@ -4957,6 +5623,8 @@ const _chatStoreOptions = {
         // Restore a running turn's flag (e.g. after a cap-drop forced
         // it off); the false edge stays WS-owned (idle frame).
         if (data.is_processing === true) this.processingByTab[tab] = true
+        if (typeof data.is_processing === "boolean")
+          this._publishWorkSnapshot(tab, data.is_processing)
         delete this._branchResyncPendingByTab[tab]
         return true
       } catch (e) {
@@ -4982,14 +5650,27 @@ const _chatStoreOptions = {
         : _replayEvents([], events, branchView, tab)
       const { messages, pendingJobs } = replay
       if (liveJobIds == null && _historyPageMap(this).has(tab)) {
+        const appliedMax = this._appliedMaxEventIdByTab[tab]
+        for (const event of events) {
+          const jobId = event.job_id || event.call_id
+          if (
+            (event.type === "tool_call" || event.type === "subagent_call") &&
+            typeof event.event_id === "number" &&
+            appliedMax != null &&
+            event.event_id <= appliedMax &&
+            !this.runningJobs[jobId]
+          )
+            delete pendingJobs[jobId]
+        }
         for (const message of messages) {
           for (const part of message.parts || []) {
             if (
               part.type === "tool" &&
               part.status === "running" &&
               part.jobId &&
-              this._findToolPart(tab, this.messagesByTab[tab] || [], part.name, part.jobId)
-                ?.status === "interrupted"
+              (!pendingJobs[part.jobId] ||
+                this._findToolPart(tab, this.messagesByTab[tab] || [], part.name, part.jobId)
+                  ?.status === "interrupted")
             ) {
               part.status = "interrupted"
               delete pendingJobs[part.jobId]
@@ -5029,7 +5710,7 @@ const _chatStoreOptions = {
       // ``fetchedAt`` (set only by _resyncHistory) unlocks removals of
       // tab-owned jobs the history no longer lists; branch-switch
       // rebuilds pass null and only add/merge.
-      this._reconcileRunningJobs(tab, pendingJobs, fetchedAt)
+      this._reconcileRunningJobs(tab, pendingJobs, fetchedAt, liveJobIds)
     },
 
     /**
@@ -5041,11 +5722,50 @@ const _chatStoreOptions = {
      * by the branch-isolation gate while they were elsewhere get
      * pulled in from the persisted event log.
      */
+    _adoptAuthoritativeBranchView(tab, view) {
+      const normalized = _normalizeBranchView(view)
+      if (!tab || !Object.keys(normalized).length) return
+      if (this.branchOperationByTab[tab]) return
+      if (this._browsedBranchByTab[tab]) return
+      this.branchViewByTab[tab] = { ...normalized }
+    },
+
     selectBranch(turnIndex, branchId, tabOverride = null) {
       const tab = tabOverride || this.activeTab
       if (!tab || this.branchOperationByTab[tab]) return false
-      if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
-      this.branchViewByTab[tab][turnIndex] = branchId
+      const view = { ...(this.branchViewByTab[tab] || {}), [turnIndex]: branchId }
+      const events = this.eventsByTab[tab] || []
+      const parentPaths = _indexParentPaths(events)
+      const streaming = this._streamingBranchByTab[tab]
+      if (streaming && streaming.turnIndex > turnIndex && !streaming.parentBranchPath) {
+        const previous = _resolveSelectedBranches(
+          events,
+          parentPaths,
+          this.branchViewByTab[tab],
+          false,
+        )
+        streaming.parentBranchPath = [...previous].filter(
+          ([turn]) => turn > 0 && turn < streaming.turnIndex,
+        )
+      }
+      const selected = _resolveSelectedBranches(events, parentPaths, view, false, streaming)
+      for (const turn of Object.keys(view)) {
+        if (Number(turn) > turnIndex && selected.get(Number(turn)) !== view[turn]) delete view[turn]
+      }
+      if (
+        streaming &&
+        streaming.turnIndex > turnIndex &&
+        !Object.prototype.hasOwnProperty.call(view, streaming.turnIndex) &&
+        selected.get(streaming.turnIndex) === streaming.branchId &&
+        !events.some(
+          (event) =>
+            event?.turn_index === streaming.turnIndex && event?.branch_id === streaming.branchId,
+        )
+      ) {
+        view[streaming.turnIndex] = streaming.branchId
+      }
+      this.branchViewByTab[tab] = view
+      this._browsedBranchByTab[tab] = true
       this._rebuildMessages(tab)
       // If a stream is still in flight on this tab, an off-branch
       // switch may have missed chunks; the on-branch path back also
@@ -5166,7 +5886,13 @@ const _chatStoreOptions = {
         if (!msg.parts) continue
         for (let j = msg.parts.length - 1; j >= 0; j--) {
           const p = msg.parts[j]
-          if (p.type === "tool" && p.name === name && p.status === "running") return p
+          if (
+            p.type === "tool" &&
+            p.name === name &&
+            p.status === "running" &&
+            (!jobId || !p.jobId)
+          )
+            return p
         }
       }
       return null
@@ -5217,29 +5943,59 @@ const _chatStoreOptions = {
       return null
     },
 
+    _inputEchoIdentity(data) {
+      return (
+        data.pending_id ||
+        data.request_id ||
+        (typeof data.event_id === "string" ? data.event_id : null)
+      )
+    },
+
+    _inputEchoMatch(rows, data, queued = false) {
+      const identity = this._inputEchoIdentity(data)
+      if (identity) return rows.findIndex((row) => row.role === "user" && row.eventId === identity)
+      const target = contentSignature(data.content)
+      const candidates = rows
+        .map((row, index) => ({ row, index }))
+        .filter(
+          ({ row }) =>
+            row.role === "user" &&
+            (queued || row._inputEchoPending) &&
+            (queued || !row._inputEchoConfirmed) &&
+            contentSignature(row.rawContent ?? row.contentParts ?? row.content) === target,
+        )
+      return candidates.length === 1 ? candidates[0].index : -1
+    },
+
     _handleUserInput(source, data) {
       if (!source || !this.messagesByTab[source]) return
-      // Branch isolation: a user_input echo for a non-viewed branch
-      // (e.g. another tab branched while this tab was on branch 1)
-      // must not push into the visible message list.
       if (!this._frameMatchesViewedBranch(source, data)) return
       const normalized = normalizeMessageContent(data.content)
-      const signature = `${source}:${contentSignature(data.content)}`
       const now = Date.now()
-      const seenAt = this._recentUserInputs[signature] || 0
-      if (now - seenAt < 2000) return
-      const msgs = this.messagesByTab[source]
-      const last = msgs[msgs.length - 1]
-      if (last?.role === "user" && last.content === normalized.content) {
-        this._recentUserInputs[signature] = now
+      const rows = this.messagesByTab[source]
+      const queue = this.queuedMessagesByTab[source] || []
+      const queuedIndex = this._inputEchoMatch(queue, data, true)
+      if (queuedIndex >= 0) {
+        Object.assign(queue[queuedIndex], normalized, { _inputEchoConfirmed: true })
         return
       }
-      this._recentUserInputs[signature] = now
-      this._addMsg(source, {
-        id: `u_sync_${now}`,
-        role: "user",
+      const idx = this._inputEchoMatch(rows, data)
+      const fields = {
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
+        eventId: this._inputEchoIdentity(data) || (idx >= 0 ? rows[idx].eventId : undefined),
+        _inputEchoConfirmed: true,
+      }
+      if (idx >= 0) {
+        Object.assign(rows[idx], fields)
+        this._historyMutationSeqByTab[source] = (this._historyMutationSeqByTab[source] || 0) + 1
+        return
+      }
+      this._addMsg(source, {
+        id: data.event_id != null ? `u_sync_${data.event_id}` : `u_sync_${_newRequestId()}`,
+        role: "user",
+        ...fields,
         timestamp: data.timestamp || new Date((data.ts || now / 1000) * 1000).toISOString(),
       })
     },
@@ -5255,27 +6011,7 @@ const _chatStoreOptions = {
       if (!source) return
       if (!this.messagesByTab[source]) return
       const queue = this.queuedMessagesByTab[source] || []
-      const target = contentSignature(data.content || "")
-      const targetText = textSignature(data.content || "")
-      // Try strict JSON signature match first (catches the common
-      // case where FE queued contentParts exactly match the backend's
-      // drained content). Fall back to a text-only comparator so a
-      // queue entry whose shape diverged from the backend's drained
-      // form (e.g. backend emitted a plain string while FE queued a
-      // content-parts list) still pops the right entry instead of
-      // sticking the banner forever AND appending a phantom bubble.
-      let idx =
-        typeof data.pending_id === "string"
-          ? queue.findIndex((message) => message.eventId === data.pending_id)
-          : -1
-      if (idx === -1) {
-        idx = queue.findIndex((m) => contentSignature(m.contentParts || m.content || "") === target)
-      }
-      if (idx === -1 && targetText) {
-        idx = queue.findIndex(
-          (m) => textSignature(m.contentParts || m.content || "") === targetText,
-        )
-      }
+      const idx = this._inputEchoMatch(queue, data, true)
       if (idx !== -1) {
         // Snapshot a fresh object before splicing — mutating + reusing
         // the reactive proxy that just left ``queuedMessagesByTab`` has
@@ -5293,26 +6029,23 @@ const _chatStoreOptions = {
         this._addMsg(source, {
           id: original.id,
           role: "user",
-          content: original.content,
-          contentParts: original.contentParts,
-          eventId: original.eventId,
+          ...normalizeMessageContent(data.content),
+          eventId: this._inputEchoIdentity(data) || original.eventId,
+          _inputEchoConfirmed: true,
+          _inputEchoPending: false,
           timestamp: original.timestamp,
           injectedMidTurn: true,
         })
         return
       }
-      // Programmatic / trigger injection — no FE counterpart.
-      const normalized = normalizeMessageContent(data.content || "")
-      const now = Date.now()
-      this._closeStreamingAssistant(source)
-      this._addMsg(source, {
-        id: `u_inj_${now}`,
-        role: "user",
-        content: normalized.content,
-        contentParts: normalized.contentParts,
-        timestamp: data.timestamp || new Date((data.ts || now / 1000) * 1000).toISOString(),
-        injectedMidTurn: true,
-      })
+      const existing = this._inputEchoMatch(this.messagesByTab[source], data)
+      if (existing < 0) this._closeStreamingAssistant(source)
+      this._handleUserInput(source, data)
+      const identity = this._inputEchoIdentity(data)
+      const row = identity
+        ? this.messagesByTab[source].find((item) => item.eventId === identity)
+        : this.messagesByTab[source].at(-1)
+      if (row) row.injectedMidTurn = true
     },
 
     _closeStreamingAssistant(source) {
@@ -5351,6 +6084,7 @@ const _chatStoreOptions = {
           sender: data.sender,
           content: normalized.content,
           contentParts: normalized.contentParts,
+          rawContent: normalized.rawContent,
           timestamp: data.timestamp,
         }
         existing.push(pushed)
@@ -5367,6 +6101,7 @@ const _chatStoreOptions = {
         sender: data.sender,
         content: normalized.content,
         contentParts: normalized.contentParts,
+        rawContent: normalized.rawContent,
         timestamp: data.timestamp,
       })
 
@@ -5389,7 +6124,11 @@ const _chatStoreOptions = {
       for (const msg of queue) {
         delete msg.queued
         delete msg.queuedTab
-        msgs.push(msg)
+        const existing = msg.eventId
+          ? msgs.find((row) => row.role === "user" && row.eventId === msg.eventId)
+          : null
+        if (existing) Object.assign(existing, msg)
+        else msgs.push(msg)
       }
       this.queuedMessagesByTab[source] = []
     },
@@ -5471,6 +6210,7 @@ const _chatStoreOptions = {
       if (source && this._streamingBranchByTab[source]) {
         delete this._streamingBranchByTab[source]
       }
+      if (source) delete this._pendingBranchPathByTab[source]
       const msgs = this.messagesByTab[source]
       if (msgs) {
         const last = msgs[msgs.length - 1]
@@ -5637,10 +6377,12 @@ const _chatStoreOptions = {
       this._cleanup()
       this._instanceGeneration++
       this._instanceId = null
+      this._instanceHostId = null
       this._instanceGraphId = null
       this._instanceType = null
       this.tabs = []
       this.messagesByTab = {}
+      this.inlineUiStateByTab = {}
       this.tokenUsage = {}
       this.subagentUsageByJob = {}
       this.runningJobs = {}
@@ -5652,15 +6394,16 @@ const _chatStoreOptions = {
       this.processingByTab = {}
       this.eventsByTab = {}
       this.modelRecoveryByTab = {}
+      this.toolArgsProgressByTab = {}
       this._localCommandResultsByTab = {}
       this._pendingCommandResultContextsByTab = {}
       this._commandResultDispatchSeq = 0
       this.branchViewByTab = {}
       this.branchOperationByTab = {}
       this.branchOperationErrorByTab = {}
-      this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
+      this._pendingBranchPathByTab = {}
       this._historyRequestSeqByTab = {}
       this._appliedMaxEventIdByTab = {}
       this._branchRequestIdByTab = {}
@@ -5698,10 +6441,13 @@ const _chatStoreOptions = {
       this._historyLoaded = false
       this._wsBuffer = []
       this.branchOperationByTab = {}
+      this._browsedBranchByTab = {}
       this.modelRecoveryByTab = {}
+      this.toolArgsProgressByTab = {}
       this.branchOperationErrorByTab = {}
       this._branchResyncPendingByTab = {}
       this._streamingBranchByTab = {}
+      this._pendingBranchPathByTab = {}
       this._historyRequestSeqByTab = {}
       this._pendingCommandResultContextsByTab = {}
       this._appliedMaxEventIdByTab = {}
@@ -5712,6 +6458,11 @@ const _chatStoreOptions = {
         clearTimeout(this._reconnectTimer)
         this._reconnectTimer = null
       }
+      this._helloWatchStop?.()
+      this._helloWatchStop = null
+      for (const { timer } of this._widgetStateTimers?.values() || []) clearTimeout(timer)
+      this._widgetStateTimers?.clear()
+      this._clearInlineUiTimers()
       this._reconnectDelay = 500
       this._autoReconnect = true
       this.wsStatus = "closed"
@@ -6137,23 +6888,29 @@ const _chatStoreOptions = {
       }
       if (controller) return controller
       const graphId = this._instanceGraphId
+      const fetchLive = (fetch, params) => {
+        if (this._instanceHostId !== useHostsStore().activeHostId) {
+          throw new Error("History belongs to a different host")
+        }
+        return fetch(graphId, tab, params)
+      }
       controller = createHistoryPageController({
         kind,
         fetchPage:
           kind === "saved"
             ? (params) => sessionAPI.getHistoryPage(opts.sessionName, tab, params)
-            : (params) => terrariumAPI.getHistoryPage(graphId, tab, params),
+            : (params) => fetchLive(terrariumAPI.getHistoryPage, params),
         getSourceKey: () =>
           kind === "saved"
             ? `saved:${opts.sessionName}:${tab}:${this._instanceId}`
-            : `live:${this._instanceGraphId}:${tab}:${this._instanceId}`,
+            : `live:${this._instanceGraphId}:${tab}:${this._instanceId}:${this._instanceHostId}:${useHostsStore().activeHostId}`,
         getInstanceGeneration: () => this._instanceGeneration,
         getMutationGeneration: () => this._historyMutationSeqByTab[tab] || 0,
         pageSize: opts.pageSize || 400,
         fetchDetail:
           kind === "saved"
             ? (params) => sessionAPI.getHistoryDetail(opts.sessionName, tab, params)
-            : (params) => terrariumAPI.getHistoryDetail(graphId, tab, params),
+            : (params) => fetchLive(terrariumAPI.getHistoryDetail, params),
         onChange: (state) => {
           this.historyPageByTab[tab] = { ...this.historyPageByTab[tab], ...state }
         },
@@ -6200,6 +6957,16 @@ const _chatStoreOptions = {
       }
     },
 
+    _publishWorkSnapshot(tab, processing = this.processingByTab[tab]) {
+      this.attentionByTab[tab] = {
+        ...(this.attentionByTab[tab] || createAttentionState()),
+        processing: processing === true,
+        background:
+          processing !== true && Object.values(this.runningJobs).some((job) => job.tab === tab),
+      }
+      publishAttention(scopeOfStoreId(this.$id) || "default", tab, this.attentionByTab[tab])
+    },
+
     _applyHistoryPageRecords(
       tab,
       controller,
@@ -6219,6 +6986,7 @@ const _chatStoreOptions = {
           tab,
         )
         this._setEvents(tab, payload.events || [])
+        this._adoptInlineUiStates(tab, payload.events || [])
         const selection = replay.branchMetadata?.branchSelection || new Map()
         adoptLocalCommandResultSelections(
           this._pendingCommandResultContextsByTab[tab],
@@ -6231,8 +6999,10 @@ const _chatStoreOptions = {
         )
         if (controller.kind !== "saved")
           this._reconcileRunningJobs(tab, replay.pendingJobs, fetchedAt)
-        if (controller.kind !== "saved" && payload.is_processing === true)
-          this.processingByTab[tab] = true
+        if (controller.kind !== "saved") {
+          this.processingByTab[tab] = payload.is_processing === true
+          this._publishWorkSnapshot(tab)
+        }
         this.historyPageByTab[tab] = { ...controller.getState(), initialized: true }
         return
       }
@@ -6261,11 +7031,17 @@ const _chatStoreOptions = {
           ),
         )
         this._setHistoryDetails(tab, records)
+        if (controller.kind !== "saved") {
+          this._reconcileRunningJobs(tab, {}, fetchedAt, payload.live_job_ids)
+          this._publishWorkSnapshot(tab)
+        }
         return
       }
       const events = this._projectHistoryPageRecords(records || [], stream)
+      this._adoptAuthoritativeBranchView(tab, payload.branch_view)
       const prepared = _prepareReplayEvents(events, this.branchViewByTab[tab] || null)
       this._setEvents(tab, prepared.events)
+      this._adoptInlineUiStates(tab, prepared.events)
       if (
         !this.tokenUsage[tab] ||
         this.tokenUsage[tab].partial ||
@@ -6273,7 +7049,7 @@ const _chatStoreOptions = {
       ) {
         this._restoreTokenUsage(tab, prepared.events, true)
       }
-      if (this.tokenUsage[tab]) {
+      if (this.tokenUsage[tab] && !this.tokenUsage[tab].backend) {
         this.tokenUsage[tab].partial = !!(
           this.historyPageByTab[tab]?.hasOlder || this.historyPageByTab[tab]?.hasNewer
         )
@@ -6284,7 +7060,7 @@ const _chatStoreOptions = {
           events,
           this.attentionByTab[tab] || createAttentionState(),
         )
-        publishAttention(scopeOfStoreId(this.$id) || "default", tab, this.attentionByTab[tab])
+        this._publishWorkSnapshot(tab)
       }
       const maxEventId = this._maxEventId(events)
       if (maxEventId != null) this._appliedMaxEventIdByTab[tab] = maxEventId
@@ -6297,6 +7073,9 @@ const _chatStoreOptions = {
      *  the current head. */
     async initHistoryPage(tab, opts = {}) {
       if (!tab) return { applied: false }
+      const kind = opts.kind || _historyPageMap(this).get(tab)?.kind || "live"
+      if (kind !== "saved" && this._instanceHostId !== useHostsStore().activeHostId)
+        return { applied: false }
       const controller = this._controllerForTab(tab, opts)
       return controller.initialize(undefined, opts.canApply)
     },
@@ -6316,6 +7095,9 @@ const _chatStoreOptions = {
     /** Refresh the newest side of the paged range (no older-range change). */
     async refreshHistoryHead(tab, opts = {}) {
       if (!tab) return { applied: false }
+      const kind = opts.kind || _historyPageMap(this).get(tab)?.kind || "live"
+      if (kind !== "saved" && this._instanceHostId !== useHostsStore().activeHostId)
+        return { applied: false }
       const controller = this._controllerForTab(tab, opts)
       return controller.refreshHead(opts.canApply)
     },
@@ -6339,6 +7121,7 @@ const _chatStoreOptions = {
       delete this.branchOperationByTab[tab]
       delete this.branchOperationErrorByTab[tab]
       delete this._branchResyncPendingByTab[tab]
+      delete this._pendingBranchPathByTab[tab]
     },
 
     /** Dispose the paged controller for ``tab`` (cached pages, in-flight fences). */
@@ -6382,11 +7165,11 @@ function _factoryFor(scope) {
       // When the macro shell tabs store closes the last tab carrying
       // this scope, free the chat store + its WS. The default scope
       // ("default") lives forever — v1 never explicitly disposes.
-      registerScopeDisposer(scope, () => {
+      registerScopeDisposer(scope, (pinia) => {
         try {
           removeAttentionScope(scope)
-          useFn()._cleanup?.()
-          useFn().$dispose?.()
+          useFn(pinia)._cleanup?.()
+          disposeScopeStore(useFn(pinia), pinia)
         } catch {
           /* swallow — disposer must not throw */
         }

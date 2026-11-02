@@ -1182,6 +1182,10 @@ export const settingsAPI = {
     const { data } = await api.get("/settings/backends")
     return data
   },
+  async getBackendTypes() {
+    const { data } = await api.get("/settings/backend-types")
+    return data
+  },
   async saveBackend(backend) {
     const { data } = await api.post("/settings/backends", backend)
     return data

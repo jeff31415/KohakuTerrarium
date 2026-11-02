@@ -6,6 +6,11 @@ import time
 from collections import deque
 from typing import Any
 
+from kohakuterrarium.core.conversation.continuation import (
+    encode_branch_view,
+    selected_branch_view,
+)
+from kohakuterrarium.core.token_ledger import context_window, token_snapshot
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.output.event import OutputEvent
 
@@ -18,6 +23,8 @@ _event_logs: dict[str, list] = {}
 # O(1) (list slicing would left-shift the whole buffer per frame).
 # Overridable for lab harnesses.
 _EVENT_LOG_MAX = int(os.environ.get("KT_EVENT_LOG_MAX", "5000"))
+MAX_CLIENT_RENDERERS = 256
+TRANSIENT_FRAMES = frozenset({"model_recovery", "tool_args_progress"})
 
 
 def get_event_log(key: str) -> deque:
@@ -38,6 +45,43 @@ def model_recovery_snapshot(agent: Any) -> dict | None:
         **state,
         "turn_index": getattr(agent, "_turn_index", None),
         "branch_id": getattr(agent, "_branch_id", None),
+    }
+
+
+def session_info_frame(creature: Any) -> dict[str, Any]:
+    """Build the per-creature ``session_info`` frame sent at attachment.
+
+    The shape matches model-switch events so initial and updated tab state use the
+    same canonical LLM name, raw model ID, and context limits, and carries the
+    creature's running ``token_usage`` / ``context_tokens`` so a viewer starts
+    from backend totals. ``source`` is the creature display name because the
+    client keys per-creature state by tab name.
+    """
+    agent = creature.agent
+    try:
+        llm_name = agent.llm_identifier()
+    except Exception:
+        llm_name = ""
+    llm = getattr(agent, "llm", None)
+    model = getattr(llm, "model", "") or getattr(agent.config, "model", "") or ""
+    max_context, compact_at = context_window(agent)
+    tokens = token_snapshot(agent)
+    return {
+        "type": "activity",
+        "activity_type": "session_info",
+        "source": creature.name,
+        "model": model,
+        "llm_name": llm_name,
+        "agent_name": creature.name,
+        "config_name": getattr(creature, "config_name", ""),
+        "config_ref": getattr(creature, "config_ref", None),
+        "max_context": max_context,
+        "compact_threshold": compact_at,
+        "token_usage": tokens["token_usage"],
+        "context_tokens": tokens["context_tokens"],
+        "model_recovery": model_recovery_snapshot(agent),
+        "branch_view": encode_branch_view(selected_branch_view(agent)),
+        "ts": time.time(),
     }
 
 
@@ -89,6 +133,65 @@ class StreamOutput(OutputModule):
         self._log = log
         self._n = 0
         self._agent = agent
+        self._client_renderers: dict[str, int] = {}
+
+    def ui_renderers(self) -> dict[str, int]:
+        """Renderers the attached client announced in its ``client_hello``."""
+        return dict(self._client_renderers)
+
+    def set_client_renderers(self, renderers: Any) -> None:
+        """Replace the client's renderer map and let the router re-aggregate."""
+        clean: dict[str, int] = {}
+        if isinstance(renderers, dict):
+            for renderer, version in list(renderers.items())[:MAX_CLIENT_RENDERERS]:
+                if (
+                    isinstance(renderer, str)
+                    and renderer
+                    and isinstance(version, int)
+                    and not isinstance(version, bool)
+                    and version >= 1
+                ):
+                    clean[renderer] = version
+        self._client_renderers = clean
+        router = getattr(self, "_router", None)
+        if router is not None and hasattr(router, "refresh_renderers"):
+            router.refresh_renderers()
+
+    async def on_widget(self, event: OutputEvent) -> None:
+        """Forward widget-family events as client frames."""
+        match event.type:
+            case "widget":
+                msg: dict = {
+                    "type": "widget",
+                    "event_id": event.id,
+                    "surface": event.surface,
+                    "interactive": bool(event.interactive),
+                    "payload": dict(event.payload),
+                }
+                if event.update_target is not None:
+                    msg["update_target"] = event.update_target
+                if event.timeout_s is not None:
+                    msg["timeout_s"] = event.timeout_s
+                self._put(msg)
+            case "widget_close":
+                self.on_widget_close(event)
+            case "widget_state":
+                self._put(
+                    {
+                        "type": "widget_state",
+                        "event_id": event.update_target,
+                        "state": dict(event.payload.get("state") or {}),
+                    }
+                )
+            case "inline_ui_state":
+                self._put({"type": "inline_ui_state", **dict(event.payload)})
+
+    def on_widget_close(self, event: OutputEvent) -> None:
+        """Send ``widget_close``, with the reason a legacy interaction ended."""
+        msg: dict = {"type": "widget_close", "event_id": event.update_target}
+        if event.payload:
+            msg["payload"] = dict(event.payload)
+        self._put(msg)
 
     def _current_turn_branch(self) -> tuple[int | None, int | None]:
         """Return positive current turn and branch IDs when both are assigned."""
@@ -112,7 +215,7 @@ class StreamOutput(OutputModule):
         if bi is not None and "branch_id" not in msg:
             msg["branch_id"] = bi
         self._q.put_nowait(msg)
-        if msg.get("type") != "model_recovery":
+        if msg.get("type") not in TRANSIENT_FRAMES:
             self._log.append(msg)
 
     async def start(self) -> None:
@@ -235,12 +338,15 @@ class StreamOutput(OutputModule):
         """Convert a native output event without changing websocket compatibility.
 
         Legacy activity keys, metadata filtering, and ID sequencing remain stable.
-        Rich UI event kinds use their own top-level frame types so the client can
-        dispatch them directly.
+        UI kinds arrive through ``on_widget`` as widget frames.
         """
         match event.type:
+            case "assistant_round_start" | "assistant_message":
+                pass
             case "model_recovery":
                 self._put({"type": "model_recovery", **event.payload})
+            case "tool_args_progress":
+                self._put({"type": "tool_args_progress", **event.payload})
             case "text":
                 content = event.content
                 if isinstance(content, str) and content:
@@ -255,8 +361,14 @@ class StreamOutput(OutputModule):
                 # not bypass the awaiting_background flag.
                 await self.on_processing_end()
             case "user_input":
-                # User input is echoed by the attachment loop to avoid duplicate frames.
-                pass
+                if event.payload.get("request_id"):
+                    self._put(
+                        {
+                            "type": "user_input",
+                            "content": event.content,
+                            **event.payload,
+                        }
+                    )
             case "assistant_image":
                 payload = event.payload
                 self.on_assistant_image(
@@ -268,35 +380,6 @@ class StreamOutput(OutputModule):
                 )
             case "resume_batch":
                 pass
-            case (
-                "ask_text"
-                | "confirm"
-                | "selection"
-                | "progress"
-                | "notification"
-                | "card"
-            ):
-                # Rich UI payloads remain nested and unfiltered for direct client dispatch.
-                msg: dict = {
-                    "type": event.type,
-                    "event_id": event.id,
-                    "interactive": bool(event.interactive),
-                    "surface": event.surface,
-                    "payload": dict(event.payload),
-                }
-                if event.update_target is not None:
-                    msg["update_target"] = event.update_target
-                if event.timeout_s is not None:
-                    msg["timeout_s"] = event.timeout_s
-                self._put(msg)
-                self._n += 1
-            case "ui_supersede":
-                self._put(
-                    {
-                        "type": "ui_supersede",
-                        "event_id": event.payload.get("event_id"),
-                    }
-                )
             case _:
                 detail = event.content if isinstance(event.content, str) else ""
                 metadata = event.payload or {}
@@ -333,6 +416,9 @@ _STREAM_METADATA_KEYS = (
     "completion_tokens",
     "total_tokens",
     "cached_tokens",
+    # Running per-creature totals and context fill (token_usage, compaction, clear).
+    "totals",
+    "context_tokens",
     "round",
     "summary",
     "messages_compacted",
@@ -359,6 +445,7 @@ _STREAM_METADATA_KEYS = (
     "turn_index",
     "branch_id",
     "pending_id",
+    "request_id",
     "final_state",
     # File-mutating tools may include a preview for immediate canvas rendering.
     "canvas_preview",

@@ -11,7 +11,7 @@ tags:
 
 For readers persisting, resuming, or archiving agent runs.
 
-A session captures the operational state of a run (conversation, events, sub-agent conversations, channel history, scratchpad, jobs, resumable triggers, and config metadata) as a single `.kohakutr` file. You can stop a creature at any point and resume exactly where it left off.
+A session records a run's conversation, events, sub-agent conversations, channel history, scratchpad, job records, resumable triggers, and config metadata in a `.kohakutr` file. Resume reconstructs a creature from these records; it does not snapshot a running process or roll back external resources.
 
 Concept primer: [memory and compaction](../concepts/modules/memory-and-compaction.md), [session and environment](../concepts/modules/session-and-environment.md).
 
@@ -35,7 +35,39 @@ The format is append-only for event data and versioned through KohakuVault's aut
 
 ### Edit and regenerate after compaction
 
-Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate rebuild the new branch from the selected message's original event prefix, ignoring compact summaries and snapshots. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
+Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate build a new branch from the target history, reusing only summaries and snapshots whose source history remains compatible. Representations that depend on modified content are not reused. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
+
+### Multimodal edit, regenerate, and branch
+
+When history is stable, editing and regenerating a user turn rebuild its original text, image, and file parts from the event log. Regenerating reuses those parts; an edit supplies the new part list and opens a sibling branch. Continuing an older branch uses that branch's history and compatible snapshots, including after resume. In Studio, editing only the text retains attachments; deleting or replacing one affects only the new branch.
+
+Saved assistant messages and settled tool results retain their structured content and call/result pairing. A failed tool may return diagnostic media or partial files; its saved output remains structured, with error and exit status recorded separately. Replaying a settled result does not execute the tool again. Different generated image bytes use different artifact paths, so a new sibling does not overwrite the earlier generated image. A settled background result is available to compatible branches that retain its call, but not to a branch that excludes that call; saving a result does not itself continue an unselected branch.
+
+Inline bytes are immutable copies: data URLs and inline file contents, including binary `FilePart.data_base64`, are retained in saved history, so mutating a derived workspace copy of an extracted file does not change later replay. Binary files are not reduced to display placeholders before storage. Request preparation still uses the existing file reader and provider capabilities; saving bytes does not imply that every MIME type is readable by the model, and display previews continue to omit base64 payloads. Live workspace paths (`file://` and similar) remain dynamic and are reread from disk when a request is prepared.
+
+Generated artifacts live beside the session file in `<session>.artifacts/` (`generated_images/`, `generated_videos/`, `tool_outputs/`). An explicit `--session` path, programmatic `session=`, or `Terrarium(session_dir=...)` owns those artifacts even when `KT_SESSION_DIR` points at a different default directory. Outgoing provider requests resolve stored artifact URLs to data URLs at the provider boundary; the conversation snapshot keeps the compact session-relative reference. Local images are resolved only for the content the provider selects: images removed by an existing request budget, or from roles the provider does not send as images, do not need to be readable for that request.
+
+New `read` image results capture the validated bytes at read time. They use
+session artifacts when storage is available and retain inline bytes otherwise.
+Deleting or overwriting the source image does not alter an earlier result;
+reading the path again captures the new contents. Existing saved `file://`
+references are unchanged and remain live references.
+
+Known limits in this release:
+
+- Studio rejects inline edit of user messages that contain part types other than text, image, and file.
+- A user message with more than one text part can still be rerun, but Studio does not rewrite those texts as a single merged field.
+- Actual history switching, edit/regenerate, and rewind are rejected while a turn or compaction is active, or background work has not settled. Ordinary same-branch input keeps its existing queueing behavior; it does not become a history switch.
+- Snapshots restore stored messages and references, not missing artifact files, processes, or external side effects. Archive the session file together with its artifacts directory. Required missing local images fail request preparation instead of silently disappearing; remote URL availability is not guaranteed.
+- These guarantees cover the framework's existing text/image/file representations and the selected provider's capabilities. They do not promise lossless visual summaries or cross-provider history migration.
+
+### Stable multimodal history with compaction and checkpoints
+
+An edit to an uncompressed tail can reuse a summary whose source inputs are unchanged. Editing a turn consumed by that summary instead rebuilds the target prefix without the dependent summary. Returning to an earlier branch or resuming its compatible checkpoint uses that branch's effective context, including retained media and call/result relationships. Restoration alone does not rerun the original tools or summarization.
+
+Compaction sends a textual projection to the summarizer, not the original images for visual analysis. Media already replaced by the selected summary need not reappear in a later provider request, although the original events and available artifact files remain in the saved history. A later tool result that the summary did not consume is not covered merely because its call came from an ancestor turn; existing provenance and context-elision rules still apply.
+
+A checkpoint can contain already-elided tool output, while raw reconstruction may rehydrate that output before the current elision policy is reapplied. These representations need not be identical dictionaries. Compare effective context under the same summary, retained-user, and elision policy; legitimate rehydration is different from restoring media that the selected summary already consumed. Local-media availability is checked only for the final effective provider input, so excluded media do not block continuation and required missing media still fail explicitly. These rules apply to stable history, not history operations during active compaction or background work.
 
 ### Older session formats
 
@@ -57,12 +89,75 @@ automatically repair a previously migrated file.
 
 `<name>` is auto-generated from the creature/terrarium name plus a timestamp.
 `KT_SESSION_DIR` changes the root for CLI, Studio, and the web API; an explicit
-`--session <path>` wins for that run. Generated media uses predictable sibling
-paths: `generated_images/` for provider-generated images and
-`generated_videos/` for videos. Generic binary tool output remains under
-`tool_outputs/`. Existing artifact paths remain readable and are not migrated.
-Deleting session data does not delete its retained artifacts. Use
-`--no-session` to opt out of session persistence.
+`--session <path>` wins for that run. Generated media is stored beside the
+session file that owns the run — including a custom `session=` path or a
+`Terrarium(session_dir=...)` run — not under a global `KT_SESSION_DIR` when
+those differ. Predictable sibling paths: `generated_images/` for
+provider-generated images and `generated_videos/` for videos. Generic binary
+tool output remains under `tool_outputs/`. Existing artifact paths remain
+readable and are not migrated. Deleting session data does not delete its
+retained artifacts. Use `--no-session` to opt out of session persistence.
+
+### Runtime storage boundaries
+
+Keep session storage directories and their ancestor directories in place while the
+process is running. Deleting, renaming, or moving them at runtime is undefined
+behavior and the caller's responsibility, including through Web file management,
+Lab, editors, shell commands, or external programs. The framework does not add a
+filesystem monitor or permission gate to enforce this requirement.
+
+Likewise, directly editing, replacing, deleting, or renaming `.kohakutr` databases
+or related SQLite files (such as `-wal` and `-shm`) through generic file APIs,
+write/edit tools, or raw database access is not a supported runtime maintenance
+operation. Use the session APIs for normal recording, Memory updates, migration,
+forking, and session deletion. Ordinary unrelated project-file editing is unaffected.
+
+The metadata-read coordination described below covers supported framework operations
+in one process on one machine. It does not coordinate external processes or arbitrary
+custom code that bypasses those operations, and it does not redesign concurrency
+between existing legacy readers and writers.
+
+### Inspecting an offline session from a checkout
+
+From a checkout with its dependencies available, run:
+
+```bash
+python scripts/inspect_session.py /path/to/saved.kohakutr
+python scripts/inspect_session.py /path/to/saved.kohakutr --all --search "query"
+```
+
+The inspector owns a `SessionStore.open_readonly()` handle and closes only that
+handle, including when output fails or is interrupted. It does not change session
+status or recency and does not persist reconstructed event counters on close.
+It uses the existing Store resource enrollment: an in-process fast reader delays
+opening, and source-release uncertainty prevents opening.
+
+This is **business-read-only**, not SQLite `mode=ro`: native table initialization
+and SQLite coordination can still modify schema or filesystem bytes. Use it on an
+offline session, not alongside another process writing that file. It neither borrows
+nor finalizes a running owner's Store, and adds no cross-process coordination.
+
+Summary counts enumerate keys rather than decoding event/channel/subagent payloads;
+explicit detail and search options still read their contents. Opening an old session
+without a persisted event counter can still scan event values during Store construction.
+The key-only summary optimization does not remove that separate legacy startup cost.
+
+### Saved Conversation statistics on demand
+
+Opening or refreshing a saved Session Viewer's **Conversation** tab loads the
+history index, tree and history page without computing the statistics summary.
+The index's `viewer_agents` lists main and attached agents in the same default
+order as an unfiltered summary **of the same store**, not a cluster-wide merged
+summary. History indexes still address one store; `targets` remains the unchanged
+set of legal Conversation targets, including channels. Attached discovery does not make an
+attached namespace a new Conversation target.
+
+Switching to Trace, Overview or Cost requests the current summary if needed;
+successful or pending summaries are reused within that data refresh. Trace still
+waits for the unfiltered summary's default choice unless the user selects an
+agent explicitly. Live Inspector summaries and header totals keep refreshing,
+even on Conversation. Key-only agent enumeration does not remove old Store
+initialization scans when persisted counters are missing.
 
 ## What persists
 
@@ -78,6 +173,41 @@ On each turn KohakuTerrarium records:
 - **Binary artifacts**: generated images and similar binary outputs written under `<session>.artifacts/` beside the session file.
 
 ## Resuming
+
+### Web resume preflight metadata reads
+
+`POST /api/sessions/{name}/resume/preflight` automatically attempts a selective,
+read-only metadata query for its **local metadata-reading suffix**. No configuration
+flag or request parameter is required. The query observes committed SQLite WAL data,
+materializes metadata rows, and releases source resources before decoding those rows
+in a private in-memory decoder. It does not migrate, checkpoint, or update business
+state on the source.
+
+Best effort means **admission-controlled optimization**, not silent error recovery:
+
+- If related enrolled legacy resources (for example, a live Store or Memory index)
+  occupy the source, or another fast reader wins admission, the local read uses the
+  existing copy-based path. The earlier path-resolution phase can itself wait for an
+  active fast reader before reaching this decision.
+- Once candidate source SQL has started, a read or decode failure is reported, not
+  retried through a copy. Local candidate SQL/decode failures return HTTP 500 with
+  `detail.code = session_metadata_read_failed`.
+- If source release cannot be established, related enrolled access remains blocked
+  for that file identity in the process. The preflight resource-error mapping returns
+  HTTP 503 with `detail.code = session_metadata_resource_unavailable`, including when
+  a subsequent request encounters that state during path resolution. This is not a
+  normal busy response to retry blindly. Stop related work, let workers finish, and
+  shut down/restart the process cleanly; restarting is not database repair. Do not
+  manually clear occupancy while a source handle or worker may still be alive.
+- A private decoder failure after proven source release does not quarantine the source.
+
+This optimization does not extend to shared classification or version-probe reads,
+remote/cluster preflight branches, history browsing, other metadata consumers, or the
+actual resume operation. It introduces no cross-process safety guarantee. The
+[runtime storage boundaries](#runtime-storage-boundaries) above are part of its
+supported operating conditions.
+
+### CLI resume
 
 ```bash
 kt resume --last            # most recent session
@@ -456,6 +586,17 @@ No `.kohakutr` is created. This also disables compaction's ability to recover pr
 
 ## Troubleshooting
 
+- **An old missing image blocks every request.** Run `/repair-images` to inspect
+  missing local `file://` images in completed turns older than the current turn.
+  Confirm using the displayed `/repair-images --apply <confirmation>` command
+  (or the web confirmation). Each selected image becomes a text note explaining
+  that its contents are unavailable. The repair saves only the active branch's
+  context; recorded events and sibling branches remain intact. Retry your message
+  afterwards. A changed context or file set requires a fresh preview. Current,
+  interrupted, unfinished, and unidentified turns remain protected, as do session
+  artifacts, remote URLs, and files that fail for reasons other than absence.
+  Restore or reattach those images instead. No surviving file is migrated or read
+  into a new snapshot. Repair requires an idle creature with a persisted session.
 - **Compaction runs forever / OOMs.** The compact model is the same heavy controller model. Set `compact_model` to something cheap (`gpt-4o-mini`, `claude-haiku`).
 - **Resume errors with `tool not registered`.** The creature config changed (a tool was removed) but the conversation still references it. Manually edit `config.yaml` to re-add the tool, or start a fresh session.
 - **`kt resume` can't find a session I just saw.** Sessions are resolved by prefix against filenames in `~/.kohakuterrarium/sessions/`. If you renamed the file or moved it, pass the full path.

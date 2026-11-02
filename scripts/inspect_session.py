@@ -8,6 +8,8 @@ Usage:
 import argparse
 import json
 import sys
+from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
 
 # Allow direct checkout execution without installing the package.
@@ -283,6 +285,40 @@ def print_search(store: SessionStore, query: str) -> None:
     print()
 
 
+def _sequence_counts(keys: Iterable[bytes | str], marker: str) -> Counter[str]:
+    """Count stored sequence keys by their complete namespace."""
+    counts: Counter[str] = Counter()
+    for raw_key in keys:
+        try:
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+        except UnicodeDecodeError:
+            continue
+        namespace, separator, sequence = key.rpartition(marker)
+        if separator and sequence.isascii() and sequence.isdecimal():
+            counts[namespace] += 1
+    return counts
+
+
+def _subagent_run_count(keys: Iterable[bytes | str]) -> int:
+    """Count run metadata keys, excluding conversation and other subrecords."""
+    count = 0
+    for raw_key in keys:
+        try:
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+        except UnicodeDecodeError:
+            continue
+        parts = key.rsplit(":", 2)
+        if (
+            len(parts) == 3
+            and ":" in parts[0]
+            and parts[1].isascii()
+            and parts[1].isdecimal()
+            and parts[2] == "meta"
+        ):
+            count += 1
+    return count
+
+
 def print_summary(store: SessionStore) -> None:
     """Print session identity and aggregate event, channel, and sub-agent counts."""
     meta = store.load_meta()
@@ -295,25 +331,16 @@ def print_summary(store: SessionStore) -> None:
     print(f"Agents: {meta.get('agents', [])}")
 
     agents = meta.get("agents", [])
+    event_counts = _sequence_counts(store.events.keys(), ":e")
     for agent in agents:
-        events = store.get_events(agent)
-        print(f"  {agent}: {len(events)} events")
+        print(f"  {agent}: {event_counts[str(agent)]} events")
 
-    seen_channels = set()
-    for key_bytes in store.channels.keys():
-        key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
-        parts = key.rsplit(":m", 1)
-        if len(parts) == 2:
-            seen_channels.add(parts[0])
-    total_msgs = sum(len(store.get_channel_messages(ch)) for ch in seen_channels)
-    print(f"Channels: {len(seen_channels)} ({total_msgs} messages)")
+    channel_counts = _sequence_counts(store.channels.keys(), ":m")
+    print(f"Channels: {len(channel_counts)} ({sum(channel_counts.values())} messages)")
 
-    sa_count = sum(
-        1
-        for k in store.subagents.keys()
-        if (k.decode() if isinstance(k, bytes) else k).endswith(":meta")
-    )
+    sa_count = _subagent_run_count(store.subagents.keys())
     print(f"Sub-agent runs: {sa_count}")
+    print("Counts describe stored records; payloads are not validated.")
     print()
 
 
@@ -353,7 +380,7 @@ def main():
         print(f"Error: {path} does not exist", file=sys.stderr)
         sys.exit(1)
 
-    store = SessionStore(path)
+    store = SessionStore.open_readonly(path)
 
     try:
         show_all = args.all

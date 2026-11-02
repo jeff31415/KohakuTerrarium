@@ -2,6 +2,7 @@
 Route framework chat requests through the LiteLLM SDK.
 """
 
+import asyncio
 from typing import Any, AsyncIterator
 
 import litellm
@@ -13,15 +14,15 @@ from kohakuterrarium.llm.base import (
     NativeToolCall,
     ToolSchema,
 )
-from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
-from kohakuterrarium.llm.openai_helpers import (
+from kohakuterrarium.llm.media.artifacts import resolve_message_image_urls
+from kohakuterrarium.llm.openai.helpers import (
     delta_field,
     delta_field_present,
     merge_reasoning_detail_stream,
     pack_reasoning_fields,
 )
-from kohakuterrarium.llm.openai_sanitize import strip_internal_message_fields
-from kohakuterrarium.llm.turn_segments import TurnSegmentsBuilder
+from kohakuterrarium.llm.openai.sanitize import strip_internal_message_fields
+from kohakuterrarium.llm.stream.segments import TurnSegmentsBuilder
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -74,7 +75,9 @@ class LiteLLMProvider(BaseLLMProvider):
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        params = self._build_params(messages, tools=tools, stream=True, **kwargs)
+        params = await asyncio.to_thread(
+            self._build_params, messages, tools=tools, stream=True, **kwargs
+        )
         self._last_assistant_extra_fields = {}
         segments = TurnSegmentsBuilder()
         reasoning_text = ""
@@ -177,7 +180,9 @@ class LiteLLMProvider(BaseLLMProvider):
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> ChatResponse:
-        params = self._build_params(messages, stream=False, **kwargs)
+        params = await asyncio.to_thread(
+            self._build_params, messages, stream=False, **kwargs
+        )
         self._last_tool_calls = []
         self._last_assistant_extra_fields = {}
 

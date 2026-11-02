@@ -23,6 +23,9 @@ coordination are all real.
 
 import asyncio
 import json
+import sqlite3
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -30,17 +33,24 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.core.channel import ChannelMessage
-from kohakuterrarium.core.config_types import (
+from kohakuterrarium.core.config.types import (
     AgentConfig,
     InputConfig,
     OutputConfig,
 )
 from kohakuterrarium.modules.tool.base import ToolContext
+from kohakuterrarium.session.history.replay import (
+    normalize_resumable_events,
+    replay_conversation,
+)
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.session.resume_target import resolve_resume_path
+from kohakuterrarium.session.occupancy.gate import try_fast
+from kohakuterrarium.terrarium.drive.store.migration import _migrate_same_file_drives
+from kohakuterrarium.terrarium.drive.wire import pack_drive_record
+from kohakuterrarium.session.resume.target import resolve_resume_path
 from kohakuterrarium.studio.persistence.viewer.exchanges import build_exchanges_payload
-import kohakuterrarium.terrarium.session_coord as _session_coord
-from kohakuterrarium.terrarium.drive.store import (
+import kohakuterrarium.terrarium.session.coord as _session_coord
+from kohakuterrarium.terrarium.drive.store.store import (
     DriveRepositoryClosedError,
     SqliteDriveRepository,
 )
@@ -55,33 +65,36 @@ from kohakuterrarium.terrarium.drive.config import (
     default_registrations,
 )
 from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
-from kohakuterrarium.terrarium.drive.registration import (
+from kohakuterrarium.terrarium.drive.registration.registration import (
     DriveRegistrationDescriptor,
     GenericDriveRegistration,
 )
 from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DriveQuery
+from kohakuterrarium.llm.presets.catalog import get_all_presets
 from kohakuterrarium.testing.llm import ScriptEntry
-from kohakuterrarium.terrarium.creature_ops import build_runtime_graph_snapshot_for
-from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.creature.ops import build_runtime_graph_snapshot_for
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.graph.manifest import load_manifest
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
 from kohakuterrarium.terrarium.output_log import OutputLogCapture
-from kohakuterrarium.terrarium.service import LocalTerrariumService
-from kohakuterrarium.terrarium.tools_group_channel import GroupChannelTool
-from kohakuterrarium.terrarium.tools_group_lifecycle import (
+from kohakuterrarium.terrarium.service.service import LocalTerrariumService
+from kohakuterrarium.terrarium.tools.channel import GroupChannelTool
+from kohakuterrarium.terrarium.tools.lifecycle import (
     GroupAddNodeTool,
     GroupRemoveNodeTool,
+    GroupSpawnChildTool,
     GroupStartNodeTool,
     GroupStopNodeTool,
 )
-from kohakuterrarium.terrarium.tools_group_send import (
+from kohakuterrarium.terrarium.tools.send import (
     GroupSendTool,
     SendChannelTool,
 )
-from kohakuterrarium.terrarium.tools_group_status import GroupStatusTool
-from kohakuterrarium.terrarium.tools_group_wire import GroupWireTool
+from kohakuterrarium.terrarium.tools.status import GroupStatusTool
+from kohakuterrarium.terrarium.tools.wire import GroupWireTool
 from kohakuterrarium.testing.llm import ScriptedLLM
 
-pytestmark = pytest.mark.timeout(30)
+pytestmark = pytest.mark.timeout(60)
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +148,14 @@ def _agent_config(name: str, tmp_path: Path) -> AgentConfig:
         output=OutputConfig(type="stdout"),
         tools=[],
     )
+
+
+def _dialogue(creature):
+    return [
+        message
+        for message in creature.agent.controller.conversation.to_messages()
+        if message["role"] != "system"
+    ]
 
 
 @pytest.fixture
@@ -307,6 +328,25 @@ class TestTerrariumIntegration:
         assert channel_msgs[0].payload["content"] == "status: green"
         assert channel_msgs[0].payload["sender"] == "alice"
 
+        # --- a stopped-then-started listener still hears the channel ------
+        # Stopping clears the agent's triggers; start must re-install bob's
+        # listen trigger from the graph, or bob is silently deaf on ``ops``.
+        await service.stop_creature("bob")
+        assert "bob_ops" not in ops._subscribers
+        await service.start_creature("bob")
+        await _settle()
+        assert set(ops._subscribers) == {"bob_ops"}
+        assert [t["trigger_id"] for t in await service.list_triggers("bob")] == [
+            "channel_bob_ops"
+        ]
+        await ops.send(ChannelMessage(sender="alice", content="after restart"))
+        await asyncio.sleep(0.05)
+        bob_hist = await service.chat_history("bob")
+        delivered = [
+            m for m in bob_hist["messages"] if "after restart" in str(m.get("content"))
+        ]
+        assert len(delivered) == 1
+
         # --- the Protocol's topology / status read surface ---------------
         # ``list_channels`` reflects the declared channel; the per-graph
         # ``get_graph`` exposes the live wiring edges.
@@ -464,16 +504,20 @@ class TestTerrariumIntegration:
         service = make_service()
         engine = service.engine
 
-        # A privileged "lead" — the user-created shape (Studio "new
-        # creature" and lifecycle.start_creature pass is_privileged).
+        # A privileged "lead" on a user-picked model — the shape Studio
+        # "new creature" and lifecycle.start_creature build.
+        provider, preset = next(iter(get_all_presets()))
         lead = await service.add_creature(
-            _agent_config("lead", tmp_path),
+            replace(_agent_config("lead", tmp_path), model="", provider=""),
             creature_id="lead",
             is_privileged=True,
+            llm=f"{provider}/{preset}",
         )
         gid = lead.graph_id
         # Privileged creatures get the full group_* tool surface.
         lead_agent = engine.get_creature("lead").agent
+        lead_model = lead_agent.llm_identifier()
+        assert lead_model == f"{provider}/{preset}"
         assert "group_add_node" in lead_agent.registry.list_tools()
         assert "group_channel" in lead_agent.registry.list_tools()
 
@@ -502,9 +546,29 @@ class TestTerrariumIntegration:
         assert worker.is_privileged is False  # tool-spawned workers are NOT privileged
         assert worker.parent_creature_id == "lead"
         assert "group_add_node" not in worker.agent.registry.list_tools()
+        # The worker config names its own model, so it keeps it.
+        assert worker.agent._llm_selector is None
 
-        # 2. wire — group_channel(action="wire") gives the worker a
-        # listen edge on a fresh auto-created channel.
+        # 2. wire — an undeclared channel is refused and changes nothing;
+        # once created, the same wire gives the worker a listen edge.
+        channels_before = set(engine.get_graph(gid).channels)
+        refused = await GroupChannelTool()._execute(
+            {
+                "action": "wire",
+                "channel": "tasks",
+                "creature_id": worker_id,
+                "direction": "listen",
+            },
+            context=ctx,
+        )
+        assert "channel 'tasks' does not exist" in refused.error
+        assert "group_send(to='worker'" in refused.error
+        assert set(engine.get_graph(gid).channels) == channels_before
+        assert "tasks" not in engine.get_creature(worker_id).listen_channels
+        create_res = await GroupChannelTool()._execute(
+            {"action": "create", "channel": "tasks"}, context=ctx
+        )
+        assert create_res.error is None, create_res.error
         wire_res = await GroupChannelTool()._execute(
             {
                 "action": "wire",
@@ -586,6 +650,38 @@ class TestTerrariumIntegration:
         gs_body = json.loads(gs_res.output)
         assert gs_body["delivered"] is True
         assert gs_body["to"] == worker_id
+
+        # 6b. group_spawn_child — a model-less child joins on the lead's model,
+        # linked with no channel; group_send reaches it by name.
+        helper_yaml = tmp_path / "helper.yaml"
+        helper_yaml.write_text(
+            "name: helper\nsystem_prompt: You are helper.\n"
+            "tool_format: bracket\ninput:\n  type: none\n"
+            "output:\n  type: stdout\n",
+            encoding="utf-8",
+        )
+        channels_before_spawn = set(engine.get_graph(gid).channels)
+        spawn_res = await GroupSpawnChildTool()._execute(
+            {"config_ref": str(helper_yaml), "name": "helper", "task": "warm up"},
+            context=ctx,
+        )
+        assert spawn_res.error is None, spawn_res.error
+        spawn_body = json.loads(spawn_res.output)
+        assert "channel" not in spawn_body
+        assert spawn_body["task_delivered"] is True
+        helper_id = spawn_body["creature_id"]
+        helper = engine.get_creature(helper_id)
+        assert helper.graph_id == gid
+        assert helper.parent_creature_id == "lead"
+        assert helper.agent.llm_identifier() == lead_model
+        assert helper.listen_channels == [] and helper.send_channels == []
+        assert set(engine.get_graph(gid).channels) == channels_before_spawn
+        assert engine.get_graph(gid).parent_links[helper_id] == "lead"
+        helper_send = await GroupSendTool()._execute(
+            {"to": "helper", "message": "ping helper"}, context=ctx
+        )
+        assert helper_send.error is None, helper_send.error
+        assert json.loads(helper_send.output)["to"] == helper_id
 
         # --- group_channel error paths — every rejection branch --------
         # At this point ``tasks`` + ``orders`` are both live in the graph.
@@ -742,6 +838,9 @@ class TestTerrariumIntegration:
         )
         assert del_res.error is None, del_res.error
         assert "orders" not in engine.get_graph(gid).channels
+        # Both re-checked connectivity; the channel-less helper stays in the
+        # group through its parent link.
+        assert engine.get_creature(helper_id).graph_id == gid
 
         # A designed channel that happens to share the worker's name is a
         # real channel, not the worker's direct alias: the snapshot the
@@ -765,18 +864,20 @@ class TestTerrariumIntegration:
             {"action": "delete", "channel": "worker"}, context=ctx
         )
 
-        # 9. remove — group_remove_node destroys the worker. It was the
-        # only other node so the graph just shrinks back to the lead.
+        # 9. remove — the unwires above left the worker channel-less, yet its
+        # parent link kept it in the lead's group, so the tool can remove it.
+        assert engine.get_creature(worker_id).graph_id == gid
         rm_res = await GroupRemoveNodeTool()._execute(
             {"creature_id": worker_id}, context=ctx
         )
-        assert rm_res.error is not None
-        assert "not a creature in caller" in rm_res.error
-        assert worker_id in service.engine
+        assert rm_res.error is None, rm_res.error
+        assert json.loads(rm_res.output)["removed"] == worker_id
+        assert worker_id not in service.engine
         assert {c.creature_id for c in await service.list_creatures()} == {
             "lead",
-            worker_id,
+            helper_id,
         }
+        assert engine.get_graph(gid).creature_ids == {"lead", helper_id}
         # The privileged node may NOT be removed via the tool.
         deny = await GroupRemoveNodeTool()._execute(
             {"creature_id": "lead"}, context=ctx
@@ -837,6 +938,53 @@ class TestTerrariumIntegration:
             store.append_event(
                 name, "user_message", {"content": f"before {name}"}, turn_index=1
             )
+        canonical = {}
+        for name in ("alice", "carol"):
+            stamp = {"turn_index": 1, "branch_id": 1, "parent_branch_path": []}
+            _, anchor = store.append_event(name, "assistant_round_start", {}, **stamp)
+            store.append_event(
+                name, "text_chunk", {"content": "pre-hook display"}, **stamp
+            )
+            canonical[name] = {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": f"post-hook {name}"},
+                    {
+                        "type": "file",
+                        "file": {
+                            "name": f"{name}.txt",
+                            "content": f"canonical-only {name}",
+                        },
+                        "extension": {"nested": [name]},
+                    },
+                ],
+                "provider_state": {"signature": name},
+            }
+            store.append_event(
+                name,
+                "assistant_message",
+                {"round_start_event_id": anchor, "message": canonical[name]},
+                **stamp,
+            )
+
+        def assert_canonical_replay(current_store, name, after=False):
+            raw = current_store.get_events(name)
+            starts = [
+                event["event_id"]
+                for event in raw
+                if event["type"] == "assistant_round_start"
+            ]
+            end = next(event for event in raw if event["type"] == "assistant_message")
+            assert end["round_start_event_id"] == starts[0]
+            messages = replay_conversation(
+                normalize_resumable_events(raw),
+                branch_view={1: 1, 2: 1} if after else {1: 1},
+            )
+            expected = [{"role": "user", "content": f"before {name}"}, canonical[name]]
+            if after:
+                expected.append({"role": "user", "content": f"after {name}"})
+            assert messages == expected
+
         store.flush()
         events: list = []
         collector = await _events(service, events)
@@ -878,6 +1026,8 @@ class TestTerrariumIntegration:
         assert store_alice is not store_carol
         assert store_alice.meta["parent_session_ids"] == [gid]
         assert store_carol.meta["parent_session_ids"] == [gid]
+        assert_canonical_replay(store_alice, "alice")
+        assert_canonical_replay(store_carol, "carol")
         store_alice.append_event(
             "alice", "user_message", {"content": "after alice"}, turn_index=2
         )
@@ -918,6 +1068,8 @@ class TestTerrariumIntegration:
                 if event["type"] == "user_message"
             ] == [f"before {name}", f"after {name}"]
         assert merged_store.meta["format_version"] == 2
+        for name in ("alice", "carol"):
+            assert_canonical_replay(merged_store, name, after=True)
 
         # --- AUTO-SPLIT via disconnect (the other split trigger) -------
         # The merged graph has exactly one channel (``reunite``) joining
@@ -940,6 +1092,8 @@ class TestTerrariumIntegration:
         assert post_store_alice is not post_store_carol
         assert post_store_alice.meta["parent_session_ids"] == [merged_store.session_id]
         assert post_store_carol.meta["parent_session_ids"] == [merged_store.session_id]
+        assert_canonical_replay(post_store_alice, "alice", after=True)
+        assert_canonical_replay(post_store_carol, "carol", after=True)
         # The post-split environments are distinct, freshly minted.
         assert (
             engine._environments[a3.graph_id] is not engine._environments[c3.graph_id]
@@ -953,6 +1107,7 @@ class TestTerrariumIntegration:
         # complete graph, not resurrect a standalone creature's stale snapshot.
         restart_dir = tmp_path / "cold-restart"
         original_paths = []
+        expected_histories = {}
         async with Terrarium(session_dir=restart_dir) as before_restart:
             workers = []
             for name in ("reader", "writer"):
@@ -964,10 +1119,22 @@ class TestTerrariumIntegration:
                     before_restart._session_stores[worker.graph_id].path
                 )
                 await worker.run("before merging", timeout=5)
+                user_index = next(
+                    index
+                    for index, message in enumerate(
+                        worker.agent.controller.conversation.to_messages()
+                    )
+                    if message["role"] == "user"
+                )
+                assert await worker.agent.edit_and_rerun(
+                    user_index, "sibling before merging"
+                )
+                await worker.agent.inject_input(
+                    "original continuation", branch_view={1: 1}
+                )
+                expected_histories[worker.config.name] = _dialogue(worker)
             connected = await before_restart.connect(*workers, channel="team")
             current_path = before_restart._session_stores[connected.graph_id].path
-            for worker in workers:
-                await worker.run("latest after merging", timeout=5)
             expected_ids = {worker.creature_id for worker in workers}
         for old_path in original_paths:
             assert resolve_resume_path(old_path) == Path(current_path)
@@ -977,13 +1144,69 @@ class TestTerrariumIntegration:
                     c.creature_id for c in restored.list_creatures()
                 } == expected_ids
                 for worker in restored.list_creatures():
-                    assert "latest after merging" in str(
-                        worker.agent.controller.conversation.to_messages()
-                    )
+                    assert _dialogue(worker) == expected_histories[worker.config.name]
                     assert worker.agent._turn_index == 2
                 # Repeated resume attaches to the existing canonical graph.
                 assert await restored.adopt_session(old_path) == connected.graph_id
                 assert len(restored.list_creatures()) == 2
+        async with Terrarium(session_dir=restart_dir) as merged:
+            await merged.adopt_session(current_path)
+            members = sorted(merged.list_creatures(), key=lambda c: c.config.name)
+            for member in members:
+                await member.run("latest after merging", timeout=5)
+                expected_histories[member.config.name] = _dialogue(member)
+            disconnected = await merged.disconnect(*members, channel="team")
+            assert disconnected.delta_kind == "split"
+            split_paths = {
+                member.config.name: merged._session_stores[member.graph_id].path
+                for member in members
+            }
+        for name, path in split_paths.items():
+            cold = await Terrarium.resume(path)
+            async with cold:
+                member = next(c for c in cold.list_creatures() if c.config.name == name)
+                assert _dialogue(member) == expected_histories[name]
+                await member.run("after split resume", timeout=5)
+                assert [
+                    message["content"]
+                    for message in member.agent.controller.conversation.to_messages()
+                    if message["role"] == "user"
+                ] == [
+                    "before merging",
+                    "original continuation",
+                    "latest after merging",
+                    "after split resume",
+                ]
+
+        # Without an autosession directory, only the retained child persists.
+        async with Terrarium(
+            drive_config=DriveRuntimeConfig(enabled=False)
+        ) as explicit:
+            pair = [
+                await explicit.add_creature(
+                    _agent_config(name, tmp_path),
+                    start=True,
+                    io="headless",
+                    session=False,
+                )
+                for name in ("left", "right")
+            ]
+            await explicit.connect(*pair, channel="manual")
+            await explicit.attach_session(
+                pair[0].graph_id, tmp_path / "manual.kohakutr"
+            )
+            original = pair[0].agent.session_store
+            await explicit.disconnect(*pair, channel="manual")
+            retained = next(c for c in pair if c.graph_id in explicit._session_stores)
+            detached = next(c for c in pair if c is not retained)
+            assert detached.agent.session_store is None
+            await detached.run("without persistence", timeout=5)
+            assert original.get_events(detached.name) == []
+            await retained.run("with persistence", timeout=5)
+            assert any(
+                e.get("content") == "with persistence"
+                for e in original.get_events(retained.name)
+            )
 
     async def test_split_drive_lifecycle_no_repo_race(
         self, make_service, tmp_path, monkeypatch
@@ -1393,9 +1616,17 @@ class TestTerrariumIntegration:
         # working dir — get / set round-trip.
         wd = await service.get_working_dir("scout")
         assert wd
-        new_wd = await service.set_working_dir("scout", str(tmp_path))
-        assert new_wd == str(tmp_path)
-        assert await service.get_working_dir("scout") == str(tmp_path)
+        moved = tmp_path / "moved"
+        moved.mkdir()
+        new_wd = await service.set_working_dir("scout", str(moved))
+        assert new_wd == str(moved)
+        assert await service.get_working_dir("scout") == str(moved)
+        # The saved manifest follows, so a restart rebuilds scout there.
+        scout = engine.get_creature("scout")
+        assert scout.build_pwd == str(moved)
+        scout_store = engine._session_stores[scout.graph_id]
+        saved = {c.name: c.pwd for c in load_manifest(scout_store).creatures}
+        assert saved["scout"] == str(moved)
         # plugins / modules — every engine creature carries the built-in
         # cross-cutting plugins (sandbox / budget / permgate / compact).
         plugins = await service.list_plugins("scout")
@@ -1581,9 +1812,16 @@ class TestTerrariumIntegration:
         await asyncio.sleep(0.1)
         assert len((await service.chat_history("writer"))["messages"]) == writer_pre
         assert await service.unwire_output("scout", stopped_wire["edge_id"]) is True
-        await service.start_creature("writer")
+        # A user message to the stopped (not removed) writer starts it again
+        # and is answered; the wired delivery above never woke it.
+        woken = [chunk async for chunk in service.chat("writer", "are you there")]
+        assert "".join(woken) == "ack"
+        assert engine.get_creature("writer").status == "idle"
+        writer_log = (await service.chat_history("writer"))["messages"]
+        assert len(writer_log) == writer_pre + 2
+        assert "are you there" in str(writer_log[-2])
         # Unknown targets fail closed at wiring time; no dead edge is stored.
-        from kohakuterrarium.terrarium.graph_identity import TargetNotFoundError
+        from kohakuterrarium.terrarium.graph.identity import TargetNotFoundError
 
         with pytest.raises(TargetNotFoundError):
             await service.wire_output(
@@ -1935,6 +2173,40 @@ class TestTerrariumIntegration:
 
             collector_a.cancel()
             collector.cancel()
+
+        legacy_path = tmp_path / "legacy-drive.kohakutr"
+        migrated_path = str(legacy_path) + ".drives"
+        with closing(sqlite3.connect(legacy_path)) as legacy:
+            legacy.execute(
+                "CREATE TABLE drives (drive_id TEXT PRIMARY KEY, blob TEXT NOT NULL)"
+            )
+            legacy.execute(
+                "INSERT INTO drives VALUES (?, ?)",
+                (drive_b.drive_id, json.dumps(pack_drive_record(drive_b))),
+            )
+            legacy.commit()
+        original_bytes = legacy_path.read_bytes()
+        await asyncio.to_thread(
+            _migrate_same_file_drives, str(legacy_path), migrated_path
+        )
+        assert legacy_path.read_bytes() == original_bytes
+        admission = try_fast(legacy_path, eligible=True)
+        assert admission.lease is not None, admission.reason
+        admission.lease.finish(source_released=True)
+        migrated = SqliteDriveRepository(migrated_path)
+        try:
+            restored = await migrated.get(drive_b.drive_id)
+            assert restored == drive_b
+        finally:
+            await migrated.close()
+        await asyncio.to_thread(
+            _migrate_same_file_drives, str(legacy_path), migrated_path
+        )
+        reopened = SqliteDriveRepository(migrated_path)
+        try:
+            assert await reopened.get(drive_b.drive_id) == drive_b
+        finally:
+            await reopened.close()
 
         # Bare engines now enable the generic + goal Drive runtime by default.
         assert Terrarium().drives is not None

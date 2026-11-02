@@ -11,12 +11,8 @@ from typing import Any
 
 from kohakuterrarium.errors import InvalidRequestError, NotFoundError
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.sessions import (
-    cluster_fold,
-    remote_meta,
-    remote_terrarium,
-    stop as _stop,
-)
+from kohakuterrarium.studio.sessions import remote_meta, remote_terrarium, stop as _stop
+from kohakuterrarium.studio.sessions.cluster import fold as cluster_fold
 from kohakuterrarium.studio.sessions import index_hooks as _index_hooks
 from kohakuterrarium.studio.sessions import live as _live
 from kohakuterrarium.studio.sessions import summary as _summary
@@ -50,8 +46,8 @@ from kohakuterrarium.terrarium.config import (
 )
 from kohakuterrarium.studio._runtime import as_engine, host_engine_or_none
 from kohakuterrarium.terrarium import TerrariumService
-from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.multi_node_service import MultiNodeTerrariumService
+from kohakuterrarium.terrarium.engine.engine import Terrarium
+from kohakuterrarium.terrarium.multi_node.service import MultiNodeTerrariumService
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.utils.mobile_sandbox import default_workdir
 
@@ -521,6 +517,8 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
                     "llm_name": str(meta.get("llm_name", "") or ""),
                     "running": bool(meta.get("running", True)),
                     "is_privileged": bool(meta.get("is_privileged", False)),
+                    "token_usage": dict(meta.get("token_usage") or {}),
+                    "context_tokens": int(meta.get("context_tokens", 0) or 0),
                 }
             ],
             channels=[],
@@ -818,6 +816,8 @@ def list_creatures(service: "TerrariumService", session_id: str) -> list[dict]:
                 # Cached model metadata keeps remote creature listings informative.
                 "model": str(meta.get("model", "") or ""),
                 "llm_name": str(meta.get("llm_name", "") or ""),
+                "token_usage": dict(meta.get("token_usage") or {}),
+                "context_tokens": int(meta.get("context_tokens", 0) or 0),
             }
         ]
     raise KeyError(f"session {session_id!r} not found")

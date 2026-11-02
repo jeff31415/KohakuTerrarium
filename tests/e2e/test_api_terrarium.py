@@ -44,7 +44,7 @@ from kohakuterrarium.api.app import create_app
 from kohakuterrarium.api.deps import set_service
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
-from kohakuterrarium.session.reader import SessionReader
+from kohakuterrarium.session.readonly.reader import SessionReader
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import LocalTerrariumService, Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
@@ -744,7 +744,7 @@ class TestApiTerrariumJourney:
         assert {session_id, second_id} <= graph_ids
         # Merge the second session into the first.
         resp = client.post(f"/api/sessions/topology/{session_id}/merge/{second_id}")
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         merge_body = resp.json()
         assert merge_body["merged"] is True
         survivor = merge_body["session_id"]

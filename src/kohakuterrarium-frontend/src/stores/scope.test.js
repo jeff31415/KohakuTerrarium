@@ -16,7 +16,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { createPinia, setActivePinia } from "pinia"
+import { createPinia, getActivePinia, setActivePinia } from "pinia"
 
 import {
   _resetForTests,
@@ -27,6 +27,14 @@ import {
 import { useChatStore } from "@/stores/chat"
 import { useMessagesStore } from "@/stores/messages"
 import { useStatusStore } from "@/stores/status"
+import { useEditorStore } from "@/stores/editor"
+import { useEventStreamStore } from "@/stores/eventStream"
+import { useLayoutStore } from "@/stores/layout"
+import { useCanvasStore } from "@/stores/canvas"
+import { useDrivesStore } from "@/stores/drives"
+import { useTurnRollupStore } from "@/stores/turnRollup"
+import { useTraceTimelineStore } from "@/stores/traceTimeline"
+import { useSessionDetailStore } from "@/stores/sessionDetail"
 
 beforeEach(() => {
   const map = new Map()
@@ -73,13 +81,13 @@ describe("per-scope chat store", () => {
 })
 
 describe("per-scope status store", () => {
-  it("token usage doesn't bleed between scopes", () => {
+  it("scratchpad doesn't bleed between scopes", () => {
     const a = useStatusStore("c1")
     const b = useStatusStore("c2")
-    a.tokenUsage.promptTokens = 100
-    b.tokenUsage.promptTokens = 999
-    expect(a.tokenUsage.promptTokens).toBe(100)
-    expect(b.tokenUsage.promptTokens).toBe(999)
+    a.scratchpad.k = "100"
+    b.scratchpad.k = "999"
+    expect(a.scratchpad.k).toBe("100")
+    expect(b.scratchpad.k).toBe("999")
   })
 
   it("running jobs don't bleed between scopes", () => {
@@ -98,27 +106,26 @@ describe("scope propagation across cross-store actions", () => {
   // callsites would break the per-attach isolation silently — this
   // test catches the regression by checking that token writes via a
   // chat action land on the scoped status store, not the default.
-  it("chat._handleActivity routes token usage to the SCOPED status store, not the default", () => {
+  it("chat._handleActivity routes activity to the SCOPED status store, not the default", () => {
     const chatA = useChatStore("creature_aaaa")
     chatA._handleActivity("creature_aaaa", {
-      activity_type: "token_usage",
-      prompt_tokens: 42,
-      completion_tokens: 13,
+      activity_type: "tool_start",
+      name: "bash",
+      job_id: "j1",
     })
 
-    // Scoped status store sees the increment.
+    // Scoped status store sees the job.
     const statusA = useStatusStore("creature_aaaa")
-    expect(statusA.tokenUsage.promptTokens).toBe(42)
-    expect(statusA.tokenUsage.completionTokens).toBe(13)
+    expect(statusA.runningJobs.map((j) => j.jobId)).toEqual(["j1"])
+    statusA._clearElapsedTimer()
 
     // Default (v1 singleton) status store stays untouched.
     const statusDefault = useStatusStore()
-    expect(statusDefault.tokenUsage.promptTokens).toBe(0)
-    expect(statusDefault.tokenUsage.completionTokens).toBe(0)
+    expect(statusDefault.runningJobs).toEqual([])
 
     // A second scope is also unaffected.
     const statusB = useStatusStore("creature_bbbb")
-    expect(statusB.tokenUsage.promptTokens).toBe(0)
+    expect(statusB.runningJobs).toEqual([])
   })
 
   it("chat._handleActivity in DEFAULT scope routes to default status (v1 back-compat)", () => {
@@ -128,12 +135,12 @@ describe("scope propagation across cross-store actions", () => {
       prompt_tokens: 7,
     })
     const statusDefault = useStatusStore()
-    expect(statusDefault.tokenUsage.promptTokens).toBe(7)
+    expect(statusDefault.recentEvents.map((e) => e.type)).toEqual(["token_usage"])
 
     // Per-scope status store stays untouched — singleton activity
     // doesn't bleed sideways into a scoped namespace.
     const statusOther = useStatusStore("creature_other")
-    expect(statusOther.tokenUsage.promptTokens).toBe(0)
+    expect(statusOther.recentEvents).toEqual([])
   })
 })
 
@@ -154,6 +161,64 @@ describe("per-scope messages store", () => {
 })
 
 describe("scope ref-counting + disposers", () => {
+  it("keeps repeated registration of the same disposer idempotent", () => {
+    const fn = vi.fn()
+    registerScopeDisposer("same-disposer", fn)
+    registerScopeDisposer("same-disposer", fn)
+    releaseScope("same-disposer")
+    expect(fn).toHaveBeenCalledTimes(1)
+  })
+  it("deletes all scoped state only on final release and reopens cleanly", () => {
+    const pinia = getActivePinia()
+    const scope = "release-state"
+    acquireScope(scope)
+    acquireScope(scope)
+    const factories = [
+      useChatStore,
+      useEditorStore,
+      useMessagesStore,
+      useStatusStore,
+      useEventStreamStore,
+      useLayoutStore,
+      useCanvasStore,
+      useDrivesStore,
+      useTurnRollupStore,
+      useTraceTimelineStore,
+      useSessionDetailStore,
+    ]
+    const stores = factories.map((factory) => factory(scope))
+    stores[0].messagesByTab.worker = [{ content: "x".repeat(100000) }]
+    stores[1].openFiles["/file.txt"] = { content: "old", dirty: false }
+    const sibling = useChatStore("release-sibling")
+    sibling.messagesByTab.worker = [{ content: "keep" }]
+    const singleton = useChatStore()
+    singleton.messagesByTab.worker = [{ content: "default" }]
+    releaseScope(scope)
+    expect(useChatStore(scope)).toBe(stores[0])
+    expect(stores[0].messagesByTab.worker[0].content).toHaveLength(100000)
+    releaseScope(scope)
+    for (const store of stores) expect(Object.hasOwn(pinia.state.value, store.$id)).toBe(false)
+    expect(sibling.messagesByTab.worker[0].content).toBe("keep")
+    expect(singleton.messagesByTab.worker[0].content).toBe("default")
+    acquireScope(scope)
+    expect(useChatStore(scope).messagesByTab).toEqual({})
+    expect(useEditorStore(scope).openFiles).toEqual({})
+    releaseScope(scope)
+    releaseScope("release-sibling")
+  })
+
+  it("cleans the owning Pinia when another instance becomes active", () => {
+    const owner = getActivePinia()
+    acquireScope("owner-pinia")
+    const store = useChatStore("owner-pinia")
+    store.messagesByTab.worker = [{ content: "old" }]
+    const other = createPinia()
+    setActivePinia(other)
+    releaseScope("owner-pinia")
+    expect(Object.hasOwn(owner.state.value, store.$id)).toBe(false)
+    expect(other.state.value).toEqual({})
+  })
+
   it("acquire/release fires disposer when count hits zero", () => {
     const fn = vi.fn()
     registerScopeDisposer("scope-1", fn)
@@ -186,9 +251,6 @@ describe("scope ref-counting + disposers", () => {
     acquireScope("disposable-1")
     releaseScope("disposable-1")
     // _cleanup nulls the WS handle and flips status back to "closed".
-    // (Pinia's $dispose semantics around state retention are
-    // implementation-defined, so we verify the side-effect we care
-    // about: the WebSocket is actually torn down.)
     expect(a._ws).toBeNull()
     expect(a.wsStatus).toBe("closed")
   })
