@@ -121,14 +121,21 @@ model-verified citations. Search is independent of the creature's active model.
 
 ### Provider-native media
 
-**`image_gen`**: Generate or edit an image through the provider's own
-native image backend. Currently auto-injected for Codex-backed creatures
-unless opted out with `disable_provider_tools: [image_gen]`. The executor
-never runs it; the provider returns structured image content and the
-session store persists the generated file into the session artifacts dir.
+**`image_gen`**: Generate or edit an image with the Codex subscription's
+Images endpoints (`gpt-image-2`; needs `kt login codex`). Auto-injected for
+Codex-backed creatures unless opted out with `disable_provider_tools:
+[image_gen]`, and usable on any model when listed under `tools:`. It is an
+ordinary tool: the result carries the image and the session store persists
+the generated file into the session artifacts dir.
 
-- Args: `prompt` plus provider-specific knobs when explicitly wired:
-  `output_format`, `size`, `quality`, `action`, `background`.
+- Args: `prompt`; `transparent_background`; for edits either
+  `referenced_image_paths` (up to 5 local files) or
+  `num_last_images_to_include` (1-5 recent conversation images); `gif`
+  (`frame_count`, `frame_duration_ms`) when the tool option `gif: true` is set.
+- Size, quality and the still-image format are chosen by the backend.
+- A Codex backend with its own `base_url` / `api_key` (a private or enterprise
+  deployment) receives the requests at `{base_url}/images/generations` and
+  `/images/edits` with that key; it must serve those Codex Images endpoints.
 
 ### Interactive and memory
 

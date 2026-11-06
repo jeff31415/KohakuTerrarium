@@ -32,6 +32,7 @@ import ChatComposerBar from "@/components/session-v2/chat/ChatComposerBar.vue"
 import ChatEmptyHero from "@/components/session-v2/chat/ChatEmptyHero.vue"
 import ConversationStrip from "@/components/session-v2/chat/ConversationStrip.vue"
 import { useComposerSend } from "@/components/session-v2/chat/useComposerSend"
+import { useFileDropHint } from "@/components/session-v2/chat/useFileDropHint"
 import { useTranscriptViewport } from "@/components/session-v2/chat/useTranscriptViewport"
 import { useSessionV2 } from "@/components/session-v2/model/sessionContext"
 import { useV2T } from "@/components/session-v2/model/v2Strings"
@@ -147,30 +148,10 @@ function renderMessage(message, context) {
   ])
 }
 
-const dragOver = ref(false)
-let dragDepth = 0
-const hasFiles = (ev) => Array.from(ev.dataTransfer?.types || []).includes("Files")
-function onDragEnter(ev) {
-  if (!hasFiles(ev)) return
-  ev.preventDefault()
-  dragDepth += 1
-  dragOver.value = true
-}
-function onDragLeave(ev) {
-  if (!hasFiles(ev)) return
-  dragDepth = Math.max(0, dragDepth - 1)
-  if (!dragDepth) dragOver.value = false
-}
-function onDragOver(ev) {
-  if (hasFiles(ev)) ev.preventDefault()
-}
-function onDrop(ev) {
-  dragDepth = 0
-  dragOver.value = false
-  if (!hasFiles(ev)) return
-  ev.preventDefault()
-  composer.composerEl.value?.addFiles?.(ev.dataTransfer?.files || [], undefined, "drop")
-}
+const {
+  dragOver,
+  handlers: { onDragEnter, onDragLeave, onDragOver, onDrop },
+} = useFileDropHint((dropped) => composer.composerEl.value?.addFiles?.(dropped, undefined, "drop"))
 
 function onGlobalKeydown(e) {
   if (!e.defaultPrevented && e.key === "Escape" && ctx.focused.value && viewport.processing.value) chat.interrupt(tabKey.value)
@@ -192,19 +173,20 @@ onUnmounted(unlisten)
 </script>
 
 <style scoped>
-/* Messages and composer share one centered reading column: 48rem, widening to 66rem on a wide column. */
+/* Messages and composer share one centered reading column of a fixed maximum width: resizing the column changes the empty margins first and reflows the text only once the margins are used up. */
 .kt-v2-chatcol {
+  --kt-v2-read-width: 58rem;
   container-type: inline-size;
 }
 .kt-v2-transcript :deep(.chat-messages-viewport) {
   container-type: size;
 }
 .kt-v2-read {
-  max-width: clamp(48rem, 66cqi, 66rem);
+  max-width: var(--kt-v2-read-width);
 }
 .kt-v2-transcript :deep(.kt-conversation-list) {
   width: 100%;
-  max-width: clamp(48rem, 66cqi, 66rem);
+  max-width: var(--kt-v2-read-width);
   margin-inline: auto;
   padding-inline: 1rem;
 }
